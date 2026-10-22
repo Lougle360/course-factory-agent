@@ -1,0 +1,3 @@
+[submodule "vendor/chaoyun-knowledge-base-builder"]
+	path = vendor/chaoyun-knowledge-base-builder
+	url = https://github.com/Lougle360/chaoyun-knowledge-base-builder
