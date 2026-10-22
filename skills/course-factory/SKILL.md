@@ -3,7 +3,7 @@ name: course-factory
 description: 「从书/知识库到课程」课程工厂的 L2 编排层——把一套资料通过「结构还原 → 组件提取 → 模块编排」三步转成可交给教学流水线的课程骨架。与 chaoyun-knowledge-base-builder（L1 萃取）和 fire-course-dev（L3 教学流水线）串联使用。核心约束：受版权保护的材料，交付物只能含「概括 + 定位」，不得摘录原文。触发词：从书到课、知识库转课程、萃取课程组件、组件提取、课程编排、模块映射、书变课、知识变课程、course factory、L2 编排。
 description_zh: 从书或知识库产出课程的 L2 编排层，含结构还原、组件提取与模块映射，带版权硬约束。
 category: education
-version: 0.3.0
+version: 0.4.0
 author: 掌柜
 ---
 
@@ -239,6 +239,8 @@ python restore_structure.py <派生md> <out.json> --report      # 只体检不�
 | `scripts/export_passages.py` | Stage 2b | 导出精读包（中间产物，**不进交付物**）|
 | `scripts/check_components.py` | Stage 2 闸门 | 组件清单自检，不过不放行 |
 | `scripts/check_modules.py` | Stage 3 闸门 | 编排一致性校验 + 五项双画像对照指标 |
+| `scripts/plan_to_outline.py` | **Stage 4（交 L3）** | 编排方案 → 课程大纲骨架，自带一致性校验（`gen` / `verify`）|
+| `scripts/selftest_plan_to_outline.py` | Stage 4 自检 | 八个负例证明闸门真的会拦，不是写在纸上的 |
 | `scripts/check_text_hygiene.py` | 全阶段 | **外来字符卫生闸门**，所有交付物出厂前必跑 |
 
 依赖 Python 3.13 + 标准库即可，**无需第三方包**。
@@ -258,6 +260,15 @@ python check_components.py <组件清单.md>
 
 # Stage 3 闸门 + 双画像对照指标
 python check_modules.py <方案A.md> <方案B.md> <组件清单.md>
+
+# Stage 4：编排方案 → 课程大纲（交给 L3 的那一棒）
+python plan_to_outline.py gen --plan <方案.md> --components <组件清单.md> \
+                              --profile <画像卡.yaml> --out <课程大纲.md>
+python plan_to_outline.py verify --outline <大纲.md> --plan <方案.md> \
+                                 --components <组件清单.md> --strict
+
+# Stage 4 闸门自检（改了解析或校验逻辑后必跑）
+python selftest_plan_to_outline.py --plan <方案.md> --components <清单.md> --outline <大纲.md>
 
 # 文本卫生（交付前必跑，可传多个文件）
 python check_text_hygiene.py <交付物1.md> <交付物2.md> ...
@@ -340,10 +351,40 @@ Stage 4 写总控文档时又混进两个英文单词（`Myers`/`instructors`）
 - 在 `kb-profile.yaml` 中声明 **`excluded_types: [course]`**（课程编排归 L2，避免职责重叠）
 - L1 的 `relevance` 判定是**关键词匹配，不是语义**——实测传对主题词也可能全落 `uncertain`，不要指望它筛题
 
-### 交 L3（fire-course-dev）
+### 交 L3（fire-course-dev）· Stage 4
 
-组件清单作为「讲什么」的本体输入。`fire-course-dev` 的 01 阶段原本缺失这一步
-（大纲只划模块边界，不定义模块里讲的实体），本 Skill 正好补上。
+> 🔴 **这段契约此前是假的。** 早期版本在这里写「本 Skill 正好补上」，
+> 但 `fire-course-dev` 全文检索「组件清单 / 编排方案」命中 **0 处**——
+> 它的 01 阶段只认《培训需求说明书》，根本不知道有这个输入。
+> **两边各说各话，交接棒掉在地上。** 现已双向写死，见下。
+
+交接物不是「组件清单」，而是**转好的《课程大纲》**：
+
+```
+编排方案 + 组件清单 + 画像卡
+        │  plan_to_outline.py gen
+        ▼
+  课程大纲骨架（13 节，对齐 fire-course-dev 01 的输出格式）
+        │  AI 补写语义部分
+        │  plan_to_outline.py verify --strict
+        ▼
+  可交付 L3 的《课程大纲》
+```
+
+**脚本算、AI 补的边界**（这条划分是本脚本的设计原则）：
+
+| 谁 | 做什么 |
+|---|---|
+| 脚本 | 模块序列表、组件归属、课时与配比、原材料地图、**不适合对象**（从画像卡 drop 判据反推）、模块「为什么学」（从编排决策按模块号/组件号反查）、未选用组件去向 |
+| AI | 课名、定位一句话、能力差距、学习目标行文、每模块核心问题与学习结果、核心成果扩展 |
+
+**对面必须有的对应条款**（少了这条，交接依然是单向的）：
+`fire-course-dev` 的 01 阶段已写入「输入材料两种入口」与三条硬约束
+（模块划分照抄、必须先过 `verify --strict`、不得新增组件编号）。
+**改任一侧的格式，必须同步改对面的解析**，并跑 `selftest_plan_to_outline.py`。
+
+**实测**（V1《非暴力沟通》方案 A）：11 模块 / 59 组件 / 720 分钟全部落地，
+严格模式 0 处待补，八个负例全部被拦。
 
 ---
 

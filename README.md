@@ -31,8 +31,12 @@
 
 ```
 0 接单校验 → 1 L1 萃取 → 2 L1.5 结构还原 → 3 L2 组件提取
-           → 4 L2 模块编排 → 5 L3 教学流水线 → 6 出厂
+           → 4 L2 模块编排 → 4→5 编排方案转课程大纲 → 5 L3 教学流水线 → 6 出厂
 ```
+
+**4→5 这一棒此前是断的**：`fire-course-dev` 只认《培训需求说明书》，
+全文检索「组件清单 / 编排方案」命中 0 处，两边各说各话。
+现在由 `plan_to_outline.py` 把交接固化成一次确定性转换，并双向写死接口条款。
 
 **Stage 2 常被忽略，却是全链路成败关键**：多数 PDF 经转换后 H1/H2/H3 全丢，
 此时在上层切组件，等于在没有语义边界的文本上随机下刀。
@@ -48,7 +52,8 @@
 | 2 还原 | rule | 章节 ≥2、起始行单调递增、无 <200 字空章 |
 | 3 组件 | `check_components.py` | ID 唯一、类型受控、locator 齐备、声明数=实际数、缺号有说明 |
 | 4 编排 | `check_modules.py` | 组件无孤儿、时长自洽、双画像对照指标 |
-| 5 教学 | rule | 六类教学文件齐备 |
+| 4→5 交接 | `plan_to_outline.py` | 模块不漏不多、模块名未改、时长合计一致、选用组件全部落进模块表、无编造编号、未选用组件有去向 |
+| 5 教学 | rule | 六类教学文件齐备 + 大纲交接核验 |
 | 6 出厂 | `check_text_hygiene.py` | 外来字符 + 中文散文里混入的英文单词 |
 
 **退码契约**：`0` 放行 · `1` 闸门未过 · `2` 条件不足（BLOCKED）· 可直接 `&&` 串联自动化。
@@ -109,6 +114,23 @@ python "$PL" check  --project . 4-modules --plans <方案A.md> <方案B.md>
 python "$PL" advance --project .
 ```
 
+### 只做编排方案 → 课程大纲这一棒
+
+```bash
+S=~/.workbuddy/skills/course-factory/scripts
+
+# 生成骨架（模块、组件、时长、原材料地图、不适合对象全部由脚本算定）
+python "$S/plan_to_outline.py" gen --plan <方案.md> --components <组件清单.md> \
+                                   --profile <画像卡.yaml> --out <课程大纲.md>
+
+# 补写语义部分后做严格复核（0 处待补才放行）
+python "$S/plan_to_outline.py" verify --outline <课程大纲.md> --plan <方案.md> \
+                                      --components <组件清单.md> --strict
+
+# 改了校验逻辑就重跑这组负例，确认闸门还会咬人
+python "$S/selftest_plan_to_outline.py" --plan <方案.md> --components <清单.md> --outline <大纲.md>
+```
+
 ---
 
 ## 六、⛔ 版权硬约束（最高优先级）
@@ -139,7 +161,8 @@ python "$PL" advance --project .
 
 - Stage 3/4/5 的语义判定必须由 AI 完成，脚本只能验闸门，不能代替判断
 - 结构还原依赖"章节标题重复出现"这一排版惯例；换成无章节号的文集需要改 `--pattern`
-- Stage 5 只检查教学文件是否齐备，不校验内容质量（质量由 `fire-course-dev` 自己的阶段闸门管）
+- Stage 5 检查教学文件齐备 + 大纲交接核验，但不校验教学内容质量（质量由 `fire-course-dev` 自己的阶段闸门管）
+- 大纲与编排方案的配对靠大纲头部的「上游」登记行；手写的大纲没有这行会被判不合格——交接必须可追溯
 - 版权检查目前是登记制（`strict`/`relaxed` 记进状态文件），**不自动扫描违规摘录**
 
 ---

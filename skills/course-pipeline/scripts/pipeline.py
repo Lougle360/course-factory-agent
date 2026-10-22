@@ -211,6 +211,39 @@ def gate_restore(project, st):
     return problems, notes
 
 
+def find_outlines(project):
+    return find_all(project, '课程大纲*.md')
+
+
+def outline_upstream(path):
+    """从大纲头部的「上游」行解析它对应的编排方案与组件清单文件名。
+
+    为什么要读头部而不是按文件名猜：项目里常常同时躺着多份大纲（双画像各一份），
+    靠文件名匹配会配错对象；而 gen 出来的大纲头部本来就登记了上游文件名。
+    """
+    try:
+        head = io.open(path, encoding='utf-8').read(4000)
+    except OSError:
+        return None, None
+    # 先定位含「上游」的那一行，再取该行内的反引号内容。
+    # 不用 `\*\*上游\*\*：` 去硬匹配冒号——全角半角一错就整条失配，且看不出来。
+    for ln in head.split('\n'):
+        if '上游' in ln:
+            ticks = re.findall(r'`([^`]+)`', ln)
+            if len(ticks) >= 2:
+                return ticks[0].strip(), ticks[1].strip()
+            return None, None
+    return None, None
+
+
+def locate_by_name(project, name):
+    p = Path(project) / name
+    if p.exists():
+        return p
+    hits = list(Path(project).rglob(Path(name).name))
+    return hits[0] if hits else None
+
+
 def gate_teaching(project, st):
     problems, notes = [], []
     missing = []
@@ -221,6 +254,41 @@ def gate_teaching(project, st):
             missing.append(label)
     if missing:
         problems.append('L3 缺失：' + '、'.join(missing))
+
+    # 交接核验：有编排方案就有义务把大纲转出来，且必须过严格校验。
+    # 少了这一步，L3 可能拿着自己另写的大纲往下做，Stage 4 的取舍就白排了。
+    plans = find_plans(project)
+    outlines = find_outlines(project)
+    if plans and not outlines:
+        problems.append('存在编排方案却没有课程大纲：Stage 4 → 5 的交接没做，'
+                        '先跑 plan_to_outline.py gen')
+    script = SKILLS / 'course-factory' / 'scripts' / 'plan_to_outline.py'
+    checked = 0
+    for o in outlines:
+        plan_name, comp_name = outline_upstream(o)
+        if not plan_name or not comp_name:
+            problems.append('%s 头部未登记上游，无法核验交接' % o.name)
+            continue
+        p = locate_by_name(project, plan_name)
+        c = locate_by_name(project, comp_name)
+        if p is None or c is None:
+            problems.append('%s 登记的上游文件找不到：%s / %s'
+                            % (o.name, plan_name, comp_name))
+            continue
+        if not script.exists():
+            notes.append('未找到 plan_to_outline.py，跳过交接核验')
+            break
+        proc = subprocess.run(
+            [sys.executable, str(script), 'verify', '--outline', str(o),
+             '--plan', str(p), '--components', str(c), '--strict'],
+            capture_output=True, text=True)
+        if proc.returncode == 0:
+            checked += 1
+        else:
+            problems.append('%s 未过 plan_to_outline 严格校验（退码 %d）'
+                            % (o.name, proc.returncode))
+    if checked:
+        notes.append('课程大纲 %d 份过 plan_to_outline 严格校验' % checked)
     return problems, notes
 
 
