@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 流水线运行时的中间产物（不进仓库）
+pipeline-state.json
+kb/
+derived/
+**/chapters.json
+**/fragments.jsonl
+**/candidates.json
+**/passages.md
+
+# 本机
+.DS_Store
+Thumbs.db
+*.log
