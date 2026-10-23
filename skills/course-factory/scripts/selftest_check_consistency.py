@@ -39,20 +39,25 @@ PPT = FILES[5]
 
 # ── 工具 ────────────────────────────────────────────
 def fresh():
-    """重建干净副本，并把它「修好」——两套口径统一为 960 / 480。
+    """重建干净副本，并「幂等地」把整套口径压成 960 / 480 一致态。
 
-    修好之后理应退 0，这是所有负例的共同基线（C0）。"""
+    幂等是关键：外部文档本身可能已经在 960（真实发生过），也可能还在 720，
+    自测必须在两种情形下都能构造出同一个已知起点。用正则而非字面串。
+    """
     if os.path.isdir(WORK):
         shutil.rmtree(WORK)
     os.makedirs(WORK)
     for f in FILES:
         shutil.copy(os.path.join(SRC, f), os.path.join(WORK, f))
-    sub(SPEC, "| 时长 | 720 分钟（2 天 × 360 分钟） |",
-        "| 时长 | 960 分钟（2 天 × 480 分钟） |")
-    sub(SPEC, "| 时间安排 | 每天 360 分钟，含茶歇与午休 |",
-        "| 时间安排 | 每天 480 分钟，含茶歇与午休 |")
-    sub(OUTLINE, "| 建议时长 | 720 分钟（2 天 × 360 分钟）|",
-        "| 建议时长 | 960 分钟（2 天 × 480 分钟）|")
+    # 需求说明书：时长行 → 960（2 天 × 480）
+    sub_re(SPEC, r"\|\s*时长\s*\|\s*\*{0,2}\d{3,4}\s*分钟[^|]*\|",
+           "| 时长 | 960 分钟（2 天 × 480 分钟，09:00–17:00） |")
+    # 需求说明书：每天分钟数 → 480
+    sub_re(SPEC, r"\|\s*时间安排\s*\|[^|]*\|",
+           "| 时间安排 | 每天 480 分钟，含茶歇与午休 |")
+    # 大纲：建议时长 → 960
+    sub_re(OUTLINE, r"\|\s*建议时长\s*\|[^|]*\|",
+           "| 建议时长 | 960 分钟（2 天 × 480 分钟）|")
     return 0
 
 
@@ -67,12 +72,27 @@ def write(f, t):
 
 
 def sub(f, old, new, count=0):
-    """替换；返回实际替换次数。count=0 表示替换全部。"""
+    """字面替换；返回实际替换次数。count=0 表示替换全部。"""
     t = read(f)
     n = t.count(old)
     if n == 0:
         return 0
     write(f, t.replace(old, new) if count == 0 else t.replace(old, new, count))
+    return n
+
+
+def sub_re(f, pattern, new, count=0):
+    """正则替换，返回替换次数。
+
+    为什么必须有它：自测不能依赖外部文档的当前状态。第一版用字面串
+    「720 → 960」构造基线，而真实文档后来真的改成 960 了，于是两个用例
+    的锚点直接失效、被静默跳过（assert 拦下的才报错，没 assert 的就假通过）。
+    用正则做幂等归一化：不管当前是 720 还是 960，都压到一致态。
+    """
+    t = read(f)
+    new_t, n = re.subn(pattern, new, t, count=0 if count == 0 else count)
+    if n:
+        write(f, new_t)
     return n
 
 
@@ -97,13 +117,15 @@ def c_baseline():
 
 def c_spec_wrong_gross():
     fresh()
-    assert sub(SPEC, "| 时长 | 960 分钟", "| 时长 | 720 分钟") == 1
+    assert sub_re(SPEC, r"\|\s*时长\s*\|\s*\*{0,2}\d{3,4}\s*分钟[^|]*\|",
+                  "| 时长 | 720 分钟（2 天 × 360 分钟） |") >= 1
     return 1
 
 
 def c_outline_wrong_gross():
     fresh()
-    assert sub(OUTLINE, "| 建议时长 | 960 分钟", "| 建议时长 | 480 分钟") == 1
+    assert sub_re(OUTLINE, r"\|\s*建议时长\s*\|[^|]*\|",
+                  "| 建议时长 | 480 分钟（1 天）|") >= 1
     return 1
 
 
@@ -128,8 +150,8 @@ def c_ppt_net_fake():
 def c_perday_not_divide():
     """总包 960 但写成 3 天 × 320：PERDAY 与计划实算的 480 冲突。"""
     fresh()
-    assert sub(SPEC, "| 时长 | 960 分钟（2 天 × 480 分钟） |",
-               "| 时长 | 960 分钟（3 天 × 320 分钟） |") == 1
+    assert sub_re(SPEC, r"\|\s*时长\s*\|[^|]*\|",
+                  "| 时长 | 960 分钟（3 天 × 320 分钟） |") >= 1
     return 1
 
 

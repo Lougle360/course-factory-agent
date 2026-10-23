@@ -112,11 +112,23 @@ SKIP_FOR_DATA = {'.git', 'build', 'node_modules'}
 SKIP_FOR_MD = SKIP_FOR_DATA | {'kb', 'blind', 'sources', 'derived', '.workbuddy'}
 
 
+def is_temp(part):
+    """临时/隐藏目录：以 _ 或 . 开头的一律不参与交付物发现。
+
+    为什么要这条规则：黑名单永远补不完。这次的实际事故是——
+    负例自测在与总控并行的同一秒，往 `_negtest_consistency/` 里写了一份
+    课程计划副本，总控的 find_all 把它当成第二份正式产物，于是同一份文件
+    出现「过闸 + 无法判定」两种结论，Stage 5 被随机判红。
+    约定：临时目录一律 `_` 或 `.` 开头，闸门永不认领。
+    """
+    return part.startswith('_') or part.startswith('.')
+
+
 def find_all(project, pattern, skip=SKIP_FOR_MD):
     hits = []
     for p in Path(project).rglob(pattern):
         rel = p.relative_to(project)
-        if any(part in skip for part in rel.parts):
+        if any(part in skip or is_temp(part) for part in rel.parts):
             continue
         hits.append(p)
     return sorted(hits)
@@ -126,7 +138,7 @@ def find_one(project, patterns, skip=SKIP_FOR_MD):
     for pat in patterns:
         for p in Path(project).rglob(pat):
             rel = p.relative_to(project)
-            if any(part in skip for part in rel.parts):
+            if any(part in skip or is_temp(part) for part in rel.parts):
                 continue
             return p
     return None
