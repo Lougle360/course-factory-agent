@@ -79,12 +79,8 @@ def pick_body_starts(hits, lines, gap):
         _, lineno, name = scored[0]
         starts.append((ch, name, lineno))
 
-    # 3. 按中文序数还原章节顺序（不受标题被误定位的影响）
-    def order(item):
-        inner = item[0].strip('第章')
-        idx = CN.find(inner[0]) if inner else -1
-        return (idx if idx >= 0 else 99, item[2])
-    starts.sort(key=order)
+    # 按选定的正文位置保持原材料顺序；章号可能含二十、百或自定义文字。
+    starts.sort(key=lambda item: item[2])
     return starts
 
 
@@ -108,8 +104,7 @@ def slice_blocks(lines, starts, total_lines):
 def health_check(blocks):
     """结构健康度后置校验。
 
-    为什么不改上游：kb-builder 的 MarkItDown 遇到损坏 PDF 会静默降级为纯文本
-    而不报错（其单测因此失败）。与其改上游源码，不如在这一层盯住结果。
+    上游已检查 PDF 容器；本层仍检查实际章节产物，转换成功不代表结构正确。
     """
     issues = []
     if len(blocks) < 2:

@@ -1,10 +1,11 @@
 ---
 name: course-factory
 description: 「从书/知识库到课程」课程工厂的 L2 编排层——把一套资料通过「结构还原 → 组件提取 → 模块编排」三步转成可交给教学流水线的课程骨架。与 chaoyun-knowledge-base-builder（L1 萃取）和 fire-course-dev（L3 教学流水线）串联使用。核心约束：受版权保护的材料，交付物只能含「概括 + 定位」，不得摘录原文。触发词：从书到课、知识库转课程、萃取课程组件、组件提取、课程编排、模块映射、书变课、知识变课程、course factory、L2 编排。
-description_zh: 从书或知识库产出课程的 L2 编排层，含结构还原、组件提取与模块映射，带版权硬约束。
-category: education
-version: 0.5.0
-author: 掌柜
+metadata:
+  description_zh: 从书或知识库产出课程的 L2 编排层，含结构还原、组件提取与模块映射，带版权硬约束。
+  category: education
+  version: 0.5.1
+  author: 掌柜
 ---
 
 # Course Factory · L2 编排层
@@ -16,7 +17,7 @@ author: 掌柜
 ```
 L1  萃取    chaoyun-knowledge-base-builder  → 句子级碎片（不能直接用）
 L2  编排    【本 Skill】                     → 有语义边界的知识组件 + 课程模块映射
-L3  教学    fire-course-dev                 → 七件套成品课（00 需求→05 PPT）
+L3  教学    fire-course-dev                 → 六类教学材料（00 需求→05 PPT 页稿）
 ```
 
 **L1 交不出活**：它的产出是句子级碎片，不能拿来排模块。
@@ -78,7 +79,7 @@ python restore_structure.py <派生md> <out.json> --report      # 只体检不�
 | 单章 < 200 字 | FATAL | 疑似定位到目录行而非正文 |
 | 单章 > 均值 5 倍 | WARN | 疑似吞并了后续章节 |
 
-> **为什么不改上游**：kb-builder 用的 MarkItDown 遇到异常 PDF 会**静默降级为纯文本而不报错**（其单测因此失败）。改上游源码会随它升级而失效，所以在这一层盯住产物。
+> **两层都要验证**：资料整理器现在在转换前检查 PDF 头和文档结构，损坏文件会记录失败；本层仍须检查实际章节产物，不能把转换成功等同于内容正确。
 >
 > **健康度闸门必须能真拦**：负例（纯目录素材、单章素材、无标题素材）已实测退出码均为 1，可直接挂流水线。
 
@@ -98,6 +99,8 @@ python restore_structure.py <派生md> <out.json> --report      # 只体检不�
 > **规则：脚本输出只能当候选队列，绝不许直接写入组件清单的 type 字段。**
 
 裁定完成后必须过闸门：`check_components.py`（见第六节）。
+
+组件清单须采用 [runtime-contract.md](references/runtime-contract.md) 的「三、逐章组件明细」小节与固定列顺序，编排方案也须遵守该接口。首次生成组件/方案前读取，避免校验器与大纲生成器读取不同结构。
 
 ### Stage 3 · 模块编排（核心增量）
 
@@ -191,7 +194,9 @@ python restore_structure.py <派生md> <out.json> --report      # 只体检不�
 |---|---|---:|---|
 | 1 | **位次反转**：同一组件在两方案中模块序号差 ≥3 的数量 | ≥3 处 | 14 处 / 5 处 ✅ |
 | 2 | **Do 层内 P/E/T/R 意图占比最大单项差** | ≥15pp | 27.5pp / **44.2pp** ✅ |
-| 3 | **反向取舍**：一方进模块序列、另一方判「舍」 | ≥10 处 | 16 处 ✅ |
+| 参考 | **反向取舍**：一方进模块序列、另一方判「舍」 | 诊断指标，不作为当前硬门槛 | 历史样本 16 处 |
+
+脚本当前硬门槛只有第 1、2 项，阈值保持不变。反向取舍、Jaccard 等用于解释，不宣称已执行第三个硬门槛。明确只做一门课时，使用 `check_modules.py --single <方案.md> <组件清单.md>`，仍检查单方案结构，不验证双画像差异；总控另要求记录理由。
 
 **最强的定性证据**：同一组件的相反处理。
 `C046 愤怒四步`（中层：Act 层长期修正 / 客服：Do 层第一个实操）、
@@ -240,14 +245,14 @@ python restore_structure.py <派生md> <out.json> --report      # 只体检不�
 | `scripts/check_components.py` | Stage 2 闸门 | 组件清单自检，不过不放行 |
 | `scripts/check_modules.py` | Stage 3 闸门 | 编排一致性校验 + 五项双画像对照指标 |
 | `scripts/plan_to_outline.py` | **Stage 4（交 L3）** | 编排方案 → 课程大纲骨架，自带一致性校验（`gen` / `verify`）|
-| `scripts/selftest_plan_to_outline.py` | Stage 4 自检 | 八个负例证明闸门真的会拦，不是写在纸上的 |
+| `scripts/selftest_plan_to_outline.py` | Stage 4 自检 | 自带合成夹具，核验正常交接和破坏模块/组件/时长/小节的反例 |
 | `scripts/check_schedule.py` | Stage 5 闸门 | **课程计划时间自洽**：时间轴连续性 + 逐模块时长比对 + 总量 |
 | `scripts/check_consistency.py` | Stage 5 闸门 | **跨文件交付口径**：GROSS/NET/PERDAY 必须以大纲模块之和与计划实排为唯一权威源 |
-| `scripts/selftest_check_consistency.py` | Stage 5 自检 | 九个负例，含「引号内引用不得稀释真值」这一条 |
+| `scripts/selftest_check_consistency.py` | Stage 5 自检 | 自带合成夹具，核验总包/净时长/逐日声明/引用/多课目录 |
 | `scripts/check_copyright.py` | Stage 6 闸门 | **版权扫描制**：交付物是否混入原材料原文（连续 20 字精确命中即拦）|
 | `scripts/check_text_hygiene.py` | 全阶段 | **外来字符卫生闸门**，所有交付物出厂前必跑 |
 
-依赖 Python 3.13 + 标准库即可，**无需第三方包**。
+本层生产脚本使用 Python 标准库，已在本机 Python 3.14.9 验证；完整总控回归另需要 PyYAML。组织交付目录、显式清单、时间轴和上游引用时，读取 [references/runtime-contract.md](references/runtime-contract.md)。
 
 ```bash
 # Stage 1（L1.5）：结构还原 + 健康度校验
@@ -272,7 +277,7 @@ python plan_to_outline.py verify --outline <大纲.md> --plan <方案.md> \
                                  --components <组件清单.md> --strict
 
 # Stage 4 闸门自检（改了解析或校验逻辑后必跑）
-python selftest_plan_to_outline.py --plan <方案.md> --components <清单.md> --outline <大纲.md>
+python selftest_plan_to_outline.py
 
 # Stage 5 闸门：课程计划时间自洽（分钟级排期）
 python check_schedule.py <课程计划.md> --outline <大纲.md>
@@ -443,7 +448,7 @@ Stage 4 写总控文档时又混进两个英文单词（`Myers`/`instructors`）
 ## 十、执行纪律
 
 1. **每一步的输出都要能独立核验**——产出统计数据（组件数、类型分布、章节覆盖），不放空话
-2. **脚本错了不要改上游**——在 L2 层加校验，避免跟随上游更新而失效
+2. **按根因修复并保留两层校验**——上游解析与下游结构检查互补；升级依赖后重跑回归，不能以转换成功代替内容验收
 3. **发现新伪类型就补进 `PSEUDO_TYPES`**——让下一次自动拦下
 4. **掌柜说怎么处理版权就怎么处理**——但每次产出必须在头部明示当前采用的版权口径
 5. **交付前必跑文本卫生闸门**——同一个坑踩三次之后，就不再相信「下次注意」这种承诺

@@ -1,197 +1,182 @@
 # course-factory-agent
 
-> 给它一本书或一个知识库，它产出一门能上的课。
->
-> 一个由四个 Skill 串联而成的课程工厂流水线：**萃取 → 还原 → 编排 → 教学**，每阶段出口有真闸门，退码即判决。
+> 给它一本书或一套知识库，把可追溯资料组织成可继续开发、可检查的培训课程。
 
----
+本仓库由三个本地 Skill 和一个资料整理器子模块组成：
 
-## 一、它解决什么问题
-
-把一本书变成一门课，难的不是"写内容"，而是**中间那几步全靠人脑托盘**：
-
-- 素材转出来是一整条没有层级的文本流，直接切组件等于随机下刀
-- 组件好摘，但"这批组件给不同的人该怎么取舍排序"没有判据
-- 一层一环往下做，各段之间无人互检，返工成本全堆到最后
-
-本仓库把这个流程做成了**可执行流水线**：每一层做什么、上一层交什么、出口过什么闸、不过往哪退，全部明文规定，并且**由脚本执行**（不是写在文档里等人自觉）。
-
----
-
-## 二、四层结构
-
-| 层 | Skill | 职责 | 位置 |
-|---|---|---|---|
-| **L0 总控** | `course-pipeline` | 路由 / 闸门 / 状态机，自己不产内容 | 本仓库 `skills/course-pipeline` |
-| **L1 萃取** | `chaoyun-knowledge-base-builder` | 多格式素材 → 可追溯碎片 | 外部仓库（submodule） |
-| **L1.5 + L2 编排** | `course-factory` | 结构还原 → 组件提取 → 模块编排 | 本仓库 `skills/course-factory` |
-| **L3 教学** | `fire-course-dev` | 需求→大纲→计划→讲义→教员手册→PPT 页稿 | 本仓库 `skills/fire-course-dev` |
-
-流水线七阶段：
-
-```
-0 接单校验 → 1 L1 萃取 → 2 L1.5 结构还原 → 3 L2 组件提取
-           → 4 L2 模块编排 → 4→5 编排方案转课程大纲 → 5 L3 教学流水线 → 6 出厂
-```
-
-**4→5 这一棒此前是断的**：`fire-course-dev` 只认《培训需求说明书》，
-全文检索「组件清单 / 编排方案」命中 0 处，两边各说各话。
-现在由 `plan_to_outline.py` 把交接固化成一次确定性转换，并双向写死接口条款。
-
-**Stage 2 常被忽略，却是全链路成败关键**：多数 PDF 经转换后 H1/H2/H3 全丢，
-此时在上层切组件，等于在没有语义边界的文本上随机下刀。
-
----
-
-## 三、闸门：写给人看的规矩会失效，写成退码的规矩不会
-
-| 阶段出口 | 闸门 | 检查什么 |
+| 层 | Skill | 职责 |
 |---|---|---|
-| 0 接单 | rule | 画像卡必须有非空 `selection_rules` 键、素材可读、版权口径已声明 |
-| 1 萃取 | rule | 碎片数 > 0 |
-| 2 还原 | rule | 章节 ≥2、起始行单调递增、无 <200 字空章 |
-| 3 组件 | `check_components.py` | ID 唯一、类型受控、locator 齐备、声明数=实际数、缺号有说明 |
-| 4 编排 | `check_modules.py` | 组件无孤儿、时长自洽、双画像对照指标 |
-| 4→5 交接 | `plan_to_outline.py` | 模块不漏不多、模块名未改、时长合计一致、选用组件全部落进模块表、无编造编号、未选用组件有去向 |
-| 5 教学 | rule + `check_schedule.py` | 六类教学文件齐备 + 大纲交接核验 + **课程计划时间自洽**（时间轴连续、逐模块时长比对、总量一致）|
-| 6 出厂 | `check_text_hygiene.py` + `check_copyright.py` | 外来字符与混夹英文单词 + **原文摘录扫描**（连续 20 字精确命中即拦）|
+| L0 | `course-pipeline` | 路由、阶段检查、状态保存和返工失效 |
+| L1 | `chaoyun-knowledge-base-builder` | 多格式资料转为可追溯碎片（Git 子模块） |
+| L1.5 + L2 | `course-factory` | 结构还原、组件提取、模块编排和大纲交接 |
+| L3 | `fire-course-dev` | 需求、大纲、计划、讲义、教员手册和 PPT Storyboard |
 
-> 版权此前是「登记制」——只在文档头写一句「只用概括」，从不真查。
-> `check_copyright.py` 把它变成扫描制：往交付物里塞原文，必须被拦下。
+总控不代写内容。脚本检查可计算的结构和一致性，AI/人工负责语义判断、内容复核与试讲。
 
-**退码契约**：`0` 放行 · `1` 闸门未过 · `2` 条件不足（BLOCKED）· 可直接 `&&` 串联自动化。
+## 流程
 
-> BLOCKED ≠ FAILED。**材料缺失 ≠ 质量不合格**，两者混为一谈会制造"补了材料还报错"的排查灾难。
-
----
-
-## 四、实证记录（《非暴力沟通》全书）
-
-这条流水线不是在纸上画的，用一整本书跑通过：
-
-| 阶段 | 实测结果 |
-|---|---|
-| L1 萃取 | 1939 条碎片，但 heading_path 全空、粒度退化到句子级（中位 32 字）→ **催生了 L1.5** |
-| L1.5 还原 | 14 章，顺序正确，平均 7808 字/章，健康度校验通过 |
-| L2 组件 | 736 候选段 → AI 精读 12,317 字 → **63 个组件**，14 章全覆盖 |
-| L2 编排 | 同批组件换画像：**位次反转 14 处、Do 层意图占比差 27.5pp** |
-| 外部盲测 | 双盲评审逐字反推出「有制裁权的管理者」vs「无权力、单次接触 3–8 分钟的一线服务者」 |
-| L3 教学 | 从脚本生成的大纲一路做到 00–05 六件套 + 63 页 PPT 页稿，**七阶段退码全 0** |
-
-**完整链路首次端到端跑通**（0 接单 → 6 出厂，七道闸门退码全 0）：
-
-```
-0-intake ✅  1-extract ✅  2-restore ✅  3-components ✅
-4-modules ✅  5-teaching ✅  6-delivery ✅
+```text
+0 接单校验
+→ 1 资料萃取
+→ 2 章节结构还原
+→ 3 组件提取
+→ 4 模块编排
+→ 5 六类教学材料
+→ 6 文本卫生与原文重合扫描
 ```
 
-> 在此之前，Stage 5 只做到 01 大纲就停了——`fire-course-dev` 全文检索「组件清单 / 编排方案」
-> 命中 0 处，它根本不知道上游还能交给它这个输入。补上 `plan_to_outline.py` 与双向接口条款后，
-> 这一棒才真正接上，也才第一次把整条链从 0 跑到 6。
+每个阶段只有三种结果：
 
-**实测换来的三条硬规矩**（都已在代码/文档里固化）：
+- `0`：通过；
+- `1`：检查不合格；
+- `2`：输入不足或无法判定，必须补材料后重试。
 
-1. **脚本做定位强、做判定弱**——规则大候选类型准确率约 40%。脚本只出候选队列，**绝不许直接写 `type` 字段**。
-2. **`Know/Do/Act` 三段配比不能做画像验收判据**——两轮对照均恒为 8.3pp。它在中文技能里主要由技能性质定，粒度选错了层。已用 Do 层内 P/E/T/R 意图占比替代。
-3. **指标会被"预算"污染**——压到同样课时后 Jaccard 从 51.6% 掉到 36.2%，先看变量是不是被别的因素绑架。
+不能跳过前置阶段。素材、方案、教学文件、检查脚本或登记配置变化后，受影响阶段及下游的旧通过结果会自动失效。
 
----
+## 主要检查
 
-## 五、安装
+- 画像必须是有效 YAML，`selection_rules` 为非空规则列表。
+- 碎片、章节、组件清单不能只“有文件”，内容也必须可解析且非空。
+- 单课保留组件、时长、层级、意图和去向检查；双画像额外检查位次反转与 Do 意图差异。
+- 大纲逐模块核对名称、顺序、层级、时长和组件归属。
+- 课表使用显式 Day/日期标题，检查钟点范围、重叠、空隙、逐模块实排和短课总量。
+- 六类教学文件逐门课程对账 GROSS 总包、NET 净教学和 PERDAY 每日时长。
+- 中文原文重合扫描默认连续 20 字阻断、12 字提示，支持跨行和任意偏移。
+- 缺检查脚本、缺原材料文本、无法解析或无足够中文都不会被当成成功。
+
+这些自动检查不等于教学效果、内容忠实度、授权充分性或法律合规已经验收。
+
+## 安装
+
+需要 Git、Python，以及能使用 PyYAML 的 Python 环境。当前版本已在 Python 3.14.9 验证。
 
 ```bash
-# 1. 连同子模块一起拉取
 git clone --recurse-submodules https://github.com/Lougle360/course-factory-agent.git
-
-# 2. 把 skills/ 下的三个 skill 放进你的 skills 目录
-cp -r skills/course-pipeline  ~/.workbuddy/skills/
-cp -r skills/course-factory   ~/.workbuddy/skills/
-cp -r skills/fire-course-dev  ~/.workbuddy/skills/
-
-# 3. L1 的 kb-builder 走子模块（自带 requirements.txt，需建 venv）
-python -m venv vendor/chaoyun-knowledge-base-builder/.venv
-vendor/chaoyun-knowledge-base-builder/.venv/Scripts/python.exe \
-  -m pip install -r vendor/chaoyun-knowledge-base-builder/scripts/requirements.txt
 ```
 
-**运行本仓库的脚本只需 Python 3.13 + 标准库，无第三方依赖。**
+把 `skills/` 下三个目录复制到同一个 Skill 根目录，再把子模块放到同级目录：
 
-### 跑一条流水线
-
-```bash
-PL=~/.workbuddy/skills/course-pipeline/scripts/pipeline.py
-
-python "$PL" init --project . --source <素材.pdf> --profile <画像卡.yaml>
-python "$PL" status
-python "$PL" check  --project . <stage>          # 退码 0 才准进下一阶段
-python "$PL" check  --project . 4-modules --plans <方案A.md> <方案B.md>
-python "$PL" advance --project .
+```text
+<skills-root>/
+├─ course-pipeline/
+├─ course-factory/
+├─ fire-course-dev/
+└─ chaoyun-knowledge-base-builder/
 ```
 
-### 只做编排方案 → 课程大纲这一棒
+四个目录必须同级，因为总控按自身位置寻找兄弟 Skill；不依赖 WorkBuddy、固定盘符或特定用户名。
 
-```bash
-S=~/.workbuddy/skills/course-factory/scripts
+为资料整理器创建独立环境：
 
-# 生成骨架（模块、组件、时长、原材料地图、不适合对象全部由脚本算定）
-python "$S/plan_to_outline.py" gen --plan <方案.md> --components <组件清单.md> \
-                                   --profile <画像卡.yaml> --out <课程大纲.md>
-
-# 补写语义部分后做严格复核（0 处待补才放行）
-python "$S/plan_to_outline.py" verify --outline <课程大纲.md> --plan <方案.md> \
-                                      --components <组件清单.md> --strict
-
-# 改了校验逻辑就重跑这组负例，确认闸门还会咬人
-python "$S/selftest_plan_to_outline.py" --plan <方案.md> --components <清单.md> --outline <大纲.md>
+```powershell
+py -3.14 -m venv <skills-root>\chaoyun-knowledge-base-builder\.venv
+& <skills-root>\chaoyun-knowledge-base-builder\.venv\Scripts\python.exe -m pip install -r <skills-root>\chaoyun-knowledge-base-builder\scripts\requirements.txt
 ```
 
----
+## 快速开始
 
-## 六、⛔ 版权硬约束（最高优先级）
+PowerShell 示例：
 
-本流水线是为**受版权保护的材料**也能合规使用而设计的：
+```powershell
+$CoursePython = "<skills-root>\chaoyun-knowledge-base-builder\.venv\Scripts\python.exe"
+$CoursePipeline = "<skills-root>\course-pipeline\scripts\pipeline.py"
+$CourseProject = "<课程项目绝对路径>"
 
-> **交付物只能含「概括 + 定位」，严禁摘录原文。**
-> 改写成自己的话，保留 `locator`（章 + 行区间）以便回溯；课堂要用原文另走授权。
+& $CoursePython $CoursePipeline init --project $CourseProject --source "<素材绝对路径>" --profile "<画像卡绝对路径>"
+& $CoursePython $CoursePipeline status --project $CourseProject --detail
+& $CoursePython $CoursePipeline check --project $CourseProject 1-extract
+```
 
-这是 `course-factory` 的硬约束，写在 SKILL.md 而不是注释里。若材料为自有知识库或公版作品，
-可按你的指示放宽，但**必须在产出文件头部明示已放宽及理由**。
+素材为 PDF 等二进制时，初始化另加 `--source-text "<可读派生文本>"`，用于版权重合检查。原文件仍应保留。
 
----
+单门课必须明确登记不做双画像对照的理由：
 
-## 七、组件出处与许可
+```powershell
+& $CoursePython $CoursePipeline init --project $CourseProject --source "<素材>" --profile "<画像>" --single-course-reason "本次只开发一门课程"
+```
 
-| 组成 | 许可 / 出处 |
-|---|---|
-| `skills/course-pipeline` | MIT（本仓库）|
-| `skills/course-factory` | MIT（本仓库）|
-| `skills/fire-course-dev/SKILL.md` | MIT（本仓库）|
-| `skills/fire-course-dev/references/*.md` | **改编自一份署名 "FIRE 课程开发" 的内部方法稿（V1.0），原件未标注许可证**。本仓库仅作方法论重组与工程化，若你持有该稿权利且不希望公开，请提 issue 或邮件联系，将在 48 小时内下架相关文件。|
-| `vendor/chaoyun-knowledge-base-builder` | **第三方仓库，以 git submodule 引用**，版权归原作者所有，本仓库不主张任何权利 |
+双画像在 Stage 4 显式指定两份不同方案：
 
----
+```powershell
+& $CoursePython $CoursePipeline check --project $CourseProject 4-modules --plans "plans/方案A.md" "plans/方案B.md"
+```
 
-## 八、已知限制
+详细文件结构、组件表、编排表、课表和多课程清单格式见
+[`runtime-contract.md`](skills/course-factory/references/runtime-contract.md)。
 
-- Stage 3/4/5 的语义判定必须由 AI 完成，脚本只能验闸门，不能代替判断
-- 结构还原依赖"章节标题重复出现"这一排版惯例；换成无章节号的文集需要改 `--pattern`
-- Stage 5 检查教学文件齐备 + 大纲交接核验，但不校验教学内容质量（质量由 `fire-course-dev` 自己的阶段闸门管）
-- 大纲与编排方案的配对靠大纲头部的「上游」登记行；手写的大纲没有这行会被判不合格——交接必须可追溯
-- 版权检查目前是登记制（`strict`/`relaxed` 记进状态文件），**不自动扫描违规摘录**
+## 大纲交接
 
----
+生成器会自动创建输出父目录，并在大纲头部保留相对于大纲文件的上游路径：
 
-## 九、开发纪律（本项目自己遵守的）
+```powershell
+$FactoryScripts = "<skills-root>\course-factory\scripts"
 
-这几条不是口号，是踩过的坑：
+& $CoursePython "$FactoryScripts\plan_to_outline.py" gen `
+  --plan "<编排方案.md>" `
+  --components "<组件清单.md>" `
+  --profile "<画像卡.yaml>" `
+  --out "<课程大纲.md>"
 
-1. **闸门必须能真拦**——新写的检查要用负例试一遍，退码正确才算落地。天天误报的闸门会被当噪音忽略，比没有更糟
-2. **写完就拿真东西跑一遍**——本仓库的 Stage 2/3 闸门与总控状态机，都是被真实素材逼出 bug 后才修好的
-3. **不许为了让数字好看而改阈值**——判据失效时写清根因并给替代方案
-4. **脚本错了不要改上游**——在自家层加校验，避免跟随上游升级而失效
-5. **同一个坑踩到第四次就升级工具**——别再加强记性了
+# 补完【AI 补：…】后严格复核
+& $CoursePython "$FactoryScripts\plan_to_outline.py" verify `
+  --outline "<课程大纲.md>" `
+  --plan "<编排方案.md>" `
+  --components "<组件清单.md>" `
+  --strict
+```
 
----
+生成器区分：
+
+- 教学净时长：模块分钟之和；
+- 总时长：教学、休息、午休等全部排期之和。
+
+未选用组件也必须写明舍、自学、备选或带出及理由，不能在生成时静默丢失。
+
+## 多门课交付
+
+默认每门课一个目录，每目录恰好一份：
+
+1. 培训需求说明书
+2. 课程大纲
+3. 详细课程计划
+4. 学员课程讲义
+5. 教员课程指导手册
+6. PPT Storyboard
+
+跨目录或同目录多门课时，在项目根目录用 `course-deliverables.json` 显式登记。正式材料不要放在 `kb`、`derived`、`_drafts` 等中间目录。
+
+## 验证
+
+```powershell
+$CoursePython = "<skills-root>\chaoyun-knowledge-base-builder\.venv\Scripts\python.exe"
+
+& $CoursePython -B -m unittest discover -s "skills\course-factory\scripts" -p "test_regressions.py" -v
+& $CoursePython -B -m unittest discover -s "chaoyun-knowledge-base-builder\scripts" -p "test_*.py" -v
+& $CoursePython -m pip check
+```
+
+本次修复版验收基线：
+
+- 课程流水线 44 项测试通过；
+- 资料整理器 15 项测试通过；
+- 四个 Skill 的格式校验通过；
+- 独立合成样例从接单到出厂七阶段全部通过。
+
+测试夹具是结构验证样例，不是实际教学成品。
+
+## 版权边界
+
+处理受版权保护材料时，默认交付物只包含整理者概括和来源定位，不包含未授权原文。需要逐字使用时另行取得授权并登记范围。
+
+扫描只覆盖中文精确重合，不能识别所有改写、非中文引用或授权状态；它是出厂检查之一，不是法律结论。
+
+## 已知限制
+
+- 组件分类、模块取舍和教学内容仍需要 AI/人工做语义判断。
+- PDF 容器可解析不代表提取完整；扫描件可能需要 OCR 与人工抽检。
+- 结构还原依赖可识别章节标题；不符合排版惯例时要调整模式并复核。
+- Stage 05 输出 PPT Storyboard，不生成最终 `.pptx`。
+- 自动门禁不替代真实学员试讲、培训师可执行性和组织验收。
 
 ## License
 

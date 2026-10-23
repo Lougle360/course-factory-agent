@@ -107,9 +107,14 @@ def main():
 
     # --- 规则 4：数量一致性 ---
     actual = len(seen)
+    if actual == 0:
+        errors.append('未解析到任何组件，空清单或格式不受支持不得放行')
+    for i, line in enumerate(lines, 1):
+        if re.match(r'^\|\s*[*`]*(C\d+)', line) and not ROW.match(line):
+            errors.append(f'行{i}：组件行格式无法解析，不得静默跳过')
     m_dec = re.search(r'\*\*(\d+)\s*个组件\*\*', text)
     declared = int(m_dec.group(1)) if m_dec else None
-    if declared and declared != actual:
+    if declared is not None and declared != actual:
         errors.append(f'数量不一致：文件声明 {declared} 个，表格实际 {actual} 个')
 
     # --- 规则 5：编号缺号说明 ---
@@ -131,7 +136,7 @@ def main():
     print(f'  唯一组件数      : {actual}')
     print(f'  文件声明数      : {declared or "未声明"}')
     if seen:
-        maint = Counter(v['types'][0] for v in seen.values())
+        maint = Counter(v['types'][0] if v['types'] else '缺失类型' for v in seen.values())
         print(f'  主类型分布      : ' + ', '.join(f'{k}×{v}' for k, v in maint.most_common()))
         ch_cnt = Counter(v['chapter'] for v in seen.values())
         print(f'  章节覆盖        : {len([c for c in ch_cnt if c])} 章')

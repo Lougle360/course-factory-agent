@@ -14,7 +14,7 @@
   4. Know/Do/Act 配比最大单项差      —— 单位：百分点
   5. Do 层内 P/E/T/R 占比最大单项差   —— 单位：百分点
 
-依赖: Python 3.13 + 标准库
+依赖: Python 3.14 已验证，仅使用标准库
 """
 
 import re
@@ -51,6 +51,13 @@ def read_lines(path):
         return f.read().splitlines()
 
 
+def minutes_value(value):
+    match = re.fullmatch(r'\s*(\d+)\s*(?:分钟)?\s*', value)
+    if not match or int(match.group(1)) <= 0:
+        raise SystemExit('[FATAL] 模块分钟数须为正整数：' + value)
+    return int(match.group(1))
+
+
 def find_section(lines, title_prefix):
     """返回标题所在行号；找不到返回 -1"""
     for i, ln in enumerate(lines):
@@ -73,6 +80,7 @@ def parse_table_from(lines, start):
             cells = [c.strip() for c in ln.strip("|").split("|")]
             if not table_started:
                 if set("".join(cells)) <= set("-: "):  # 分隔行，跳过且确认是表格
+                    i += 1
                     continue
                 header = cells
                 table_started = True
@@ -130,7 +138,7 @@ def parse_plan(path):
             "seq": idx,
             "name": get("module"),
             "level": get("level").strip(),
-            "minutes": int(re.sub(r"\D", "", get("minutes")) or 0),
+            "minutes": minutes_value(get("minutes")),
             "intent": intent if intent not in ("—", "-") else "",
             "ids": ID_RE.findall(get("ids")),
             "row": idx + 1,
@@ -210,7 +218,7 @@ def run_gates(plan, valid_ids):
     tag = plan["path"].split("\\")[-1].split("/")[-1]
 
     # G1 ID 合法
-    bad = sorted({cid for m in plan["modules"] for cid in m["ids"]} - valid_ids)
+    bad = sorted(({cid for m in plan["modules"] for cid in m["ids"]} | set(plan['dropped'])) - valid_ids)
     if bad:
         errs.append(f"G1 ID 不在组件清单中: {bad}")
 
@@ -243,7 +251,7 @@ def run_gates(plan, valid_ids):
                 errs.append(f"G5 M{m['seq']} 为 Do 层但意图缺失或非法: {m['intent']!r}")
         else:
             if m["intent"]:
-                warns.append(f"G5 M{m['seq']} 非 Do 层却填了意图 {m['intent']!r}")
+                errs.append(f"G5 M{m['seq']} 非 Do 层却填了意图 {m['intent']!r}")
     intent_sum = sum(v["declared_min"] for v in plan["do_intents"].values())
     if plan["do_intents"] and intent_sum != do_min:
         errs.append(f"G5 Do 层意图分钟合计 {intent_sum} ≠ Do 层总时长 {do_min}")
@@ -338,6 +346,13 @@ def pct_line(d):
 # ---------------------------------------------------------------- main
 
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == '--single':
+        plan = parse_plan(sys.argv[2])
+        tag, errors, warns, stats = run_gates(plan, load_component_ids(sys.argv[3]))
+        for error in errors:
+            print('[FAIL] ' + error)
+        print(f'单课程一致性检查：{tag}，{stats["total_min"]} 分钟；未做双画像敏感性验收')
+        sys.exit(1 if errors else 0)
     if len(sys.argv) != 4:
         print(__doc__)
         sys.exit(2)
@@ -406,7 +421,7 @@ def main():
           f"{pa_pb_line(nk, qa.get(nk, 0), qb.get(nk, 0), nv)}")
 
     # 两套判定口径。原始五判据保留真实结果（含已证伪项），
-    # 修订口径只用两轮对照中稳定通过的三条。两边都打印，不隐藏任何一个。
+    # 修订口径使用下方明确列出的两条。其余指标保留为诊断输出。
     original = {
         "指标1 Jaccard ≤50%": (d["jaccard"] <= 50, f"{d['jaccard']:.1f}%"),
         "指标2 反向取舍 ≥10": (len(d["reverse"]) >= 10, f"{len(d['reverse'])} 处"),
@@ -428,7 +443,7 @@ def main():
     print(f"  → {'通过' if ok_all else '未通过'}")
 
     print("\n" + "=" * 68)
-    print("判定口径 B · 修订口径（只用两轮对照中稳定通过的三条）")
+    print("判定口径 B · 修订口径（位次反转、Do 意图差两条）")
     print("=" * 68)
     print("  说明：指标 4 已被证伪（两轮恒为 8.3pp，因其粒度选错层）；")
     print("        指标 1/2 分别被「课时预算」「去向粒度」污染，需归一化后才可用。")

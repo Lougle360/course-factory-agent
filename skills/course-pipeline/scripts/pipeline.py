@@ -18,6 +18,9 @@
 退码：0 = 放行；1 = 闸门未过；2 = 条件不足（BLOCKED，不算失败）
 """
 import argparse
+import hashlib
+import os
+import tempfile
 import io
 import json
 import re
@@ -26,7 +29,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-SKILLS = Path.home() / '.workbuddy' / 'skills'
+SKILLS = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(SKILLS / 'course-factory' / 'scripts'))
+from course_contracts import discover, groups, read, upstream
 STATE_NAME = 'pipeline-state.json'
 
 # ── 阶段定义：id → (名称, 执行者, 闸门类型, 闸门目标) ───────────────────────
@@ -58,7 +63,7 @@ STAGES = [
     },
     {
         'id': '5-teaching', 'name': 'L3 教学流水线', 'owner': 'fire-course-dev',
-        'out': '00–05 七件套',
+        'out': '00–05 六类教学文件',
         'gate': {'kind': 'rule', 'fn': 'teaching'},
     },
     {
@@ -80,640 +85,560 @@ TEACHING_ARTIFACTS = [
 ]
 
 
-# ── 状态文件读写 ─────────────────────────────────────────────────────────
+
+class Blocked(Exception):
+    """A required input or checker is unavailable, not a successful check."""
+
+
 def state_path(project):
     return Path(project) / STATE_NAME
 
 
-def load_state(project):
-    p = state_path(project)
-    if not p.exists():
-        print(f'[FATAL] 未找到 {p} —— 先跑 init')
-        sys.exit(2)
-    return json.loads(io.open(p, encoding='utf-8').read()), p
+def log(st, action):
+    st.setdefault('history', []).append({'ts': datetime.now().isoformat(timespec='seconds'), 'action': action})
 
 
 def save_state(project, st):
     st['updated_at'] = datetime.now().isoformat(timespec='seconds')
-    io.open(state_path(project), 'w', encoding='utf-8').write(
-        json.dumps(st, ensure_ascii=False, indent=1))
+    # Atomic replacement avoids a half-written state if interrupted.
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=project,
+                                     prefix='.pipeline-', suffix='.tmp', delete=False) as handle:
+        json.dump(st, handle, ensure_ascii=False, indent=2)
+        temp = Path(handle.name)
+    try:
+        os.replace(temp, state_path(project))
+    finally:
+        if temp.exists():
+            temp.unlink()
 
 
-def log(st, action):
-    st.setdefault('history', []).append({
-        'ts': datetime.now().isoformat(timespec='seconds'), 'action': action})
+def load_state(project):
+    p = state_path(project)
+    if not p.is_file():
+        raise Blocked(f'未找到 {p}，请先 init')
+    st = json.loads(read(p))
+    if not isinstance(st, dict) or not isinstance(st.get('stages'), dict):
+        raise Blocked('状态文件结构无效')
+    for sid in STAGE_IDS:
+        st['stages'].setdefault(sid, {'status': 'pending', 'artifacts': [], 'gate': None})
+    if refresh(project, st):
+        save_state(project, st)
+    return st, p
 
 
-# ── 产物发现 ─────────────────────────────────────────────────────────────
-# 数据类产物（chapters.json / fragments.jsonl）就住在 kb/ 下，扫它们时不能排除 kb
-# ——曾经把 kb 放进通用排除表，导致自己把自己的产物判成"没产出"。
 SKIP_FOR_DATA = {'.git', 'build', 'node_modules'}
-# 交付物类（md）扫描才需要排除中间目录，避免把 kb 里的中间文件当成品出厂
 SKIP_FOR_MD = SKIP_FOR_DATA | {'kb', 'blind', 'sources', 'derived', '.workbuddy'}
 
 
 def is_temp(part):
-    """临时/隐藏目录：以 _ 或 . 开头的一律不参与交付物发现。
-
-    为什么要这条规则：黑名单永远补不完。这次的实际事故是——
-    负例自测在与总控并行的同一秒，往 `_negtest_consistency/` 里写了一份
-    课程计划副本，总控的 find_all 把它当成第二份正式产物，于是同一份文件
-    出现「过闸 + 无法判定」两种结论，Stage 5 被随机判红。
-    约定：临时目录一律 `_` 或 `.` 开头，闸门永不认领。
-    """
-    return part.startswith('_') or part.startswith('.')
+    return part.startswith(('.', '_'))
 
 
 def find_all(project, pattern, skip=SKIP_FOR_MD):
-    hits = []
-    for p in Path(project).rglob(pattern):
-        rel = p.relative_to(project)
-        if any(part in skip or is_temp(part) for part in rel.parts):
-            continue
-        hits.append(p)
-    return sorted(hits)
+    root = Path(project).resolve()
+    return sorted(p for p in root.rglob(pattern) if p.is_file()
+                  and not any(x in skip or is_temp(x) for x in p.relative_to(root).parts))
 
 
 def find_one(project, patterns, skip=SKIP_FOR_MD):
-    for pat in patterns:
-        for p in Path(project).rglob(pat):
-            rel = p.relative_to(project)
-            if any(part in skip or is_temp(part) for part in rel.parts):
-                continue
-            return p
-    return None
+    hits = sorted({p for pattern in patterns for p in find_all(project, pattern, skip)})
+    if len(hits) > 1:
+        raise Blocked('找到多份候选，不能猜选哪份：' + ', '.join(str(p) for p in hits))
+    return hits[0] if hits else None
 
 
 def find_components_md(project):
-    return find_one(project, ['组件清单*.md', '**/组件清单*.md'])
+    return find_one(project, ['组件清单*.md'])
 
 
 def find_plans(project):
-    return find_all(project, '编排方案*.md') + find_all(project, '**/编排方案*.md')
-
-
-# ── 各种 rule 型闸门 ──────────────────────────────────────────────────────
-def gate_intake(project, st):
-    problems, notes = [], []
-    prof = st.get('profile')
-    if not prof:
-        problems.append('未登记学员画像卡（init 时用 --profile）')
-    else:
-        prof_p = Path(prof)
-        if not prof_p.exists():
-            problems.append(f'画像卡不存在：{prof}')
-        else:
-            txt = io.open(prof_p, encoding='utf-8').read()
-            # 必须是「键行」且键下有内容。曾经用全文子串匹配，结果注释里写了
-            # 「没有 selection_rules」几个字的空卡也被判成通过——
-            # 与 Stage 3「受控 ID 全文扫描」是同一类病：朴素匹配会被字面巧合骗过。
-            m = re.search(r'^\s*selection_rules\s*:\s*(\S.*)?$', txt, re.M)
-            if not m or not (m.group(1) or '').strip():
-                problems.append('画像卡缺少有效的 selection_rules 键（须为非空 YAML 键，'
-                                '且不能只出现在注释里）——没有判据的画像等于没有画像')
-            else:
-                notes.append('画像卡含非空 selection_rules 键')
-    src = st.get('source')
-    if not src or not Path(src).exists():
-        problems.append(f'素材不可读：{src}')
-    else:
-        notes.append(f"素材可读（{Path(src).stat().st_size // 1024} KB）")
-    if not st.get('copyright_stance'):
-        problems.append('未声明版权口径（默认应为 strict：只概括+定位）')
-    else:
-        notes.append(f"版权口径：{st['copyright_stance']}"
-                     + (f"（{st.get('copyright_note', '')}）" if st.get('copyright_note') else ''))
-    return problems, notes
-
-
-def gate_extract(project, st):
-    problems, notes = [], []
-    frag = find_one(project, ['fragments.jsonl', '**/fragments.jsonl'], SKIP_FOR_DATA)
-    if not frag:
-        problems.append('未产出 fragments.jsonl —— L1 萃取尚未交付')
-        return problems, notes
-    n = sum(1 for ln in io.open(frag, encoding='utf-8') if ln.strip())
-    notes.append(f'{frag.name}：{n} 条碎片')
-    if n == 0:
-        problems.append('fragments.jsonl 为空')
-    return problems, notes
-
-
-def gate_restore(project, st):
-    """chapters.json 健康度：复刻 restore_structure.py 的判据，独立于 Happy Path。"""
-    problems, notes = [], []
-    ch = find_one(project, ['chapters.json', '**/chapters.json'], SKIP_FOR_DATA)
-    if not ch:
-        problems.append('未产出 chapters.json —— L1.5 尚未交付')
-        return problems, notes
-    try:
-        blocks = json.loads(io.open(ch, encoding='utf-8').read())
-    except Exception as e:
-        problems.append(f'chapters.json 解析失败：{e}')
-        return problems, notes
-    notes.append(f'{ch.name}：{len(blocks)} 个章节块，合计 {sum(b.get("chars", 0) for b in blocks)} 字')
-    if len(blocks) < 2:
-        problems.append(f'章节块仅 {len(blocks)} 个，结构还原失败')
-    for a, b in zip(blocks, blocks[1:]):
-        if b.get('start_line', 0) <= a.get('start_line', 0):
-            problems.append(f"{b.get('chapter')} 起始行未晚于 {a.get('chapter')}，章节顺序异常")
-    for b in blocks:
-        if b.get('chars', 0) < 200:
-            problems.append(f"{b.get('chapter')} 仅 {b.get('chars')} 字，疑似定到目录行")
-    return problems, notes
+    return find_all(project, '编排方案*.md')
 
 
 def find_outlines(project):
     return find_all(project, '课程大纲*.md')
 
 
-def outline_upstream(path):
-    """从大纲头部的「上游」行解析它对应的编排方案与组件清单文件名。
-
-    为什么要读头部而不是按文件名猜：项目里常常同时躺着多份大纲（双画像各一份），
-    靠文件名匹配会配错对象；而 gen 出来的大纲头部本来就登记了上游文件名。
-    """
-    try:
-        head = io.open(path, encoding='utf-8').read(4000)
-    except OSError:
-        return None, None
-    # 先定位含「上游」的那一行，再取该行内的反引号内容。
-    # 不用 `\*\*上游\*\*：` 去硬匹配冒号——全角半角一错就整条失配，且看不出来。
-    for ln in head.split('\n'):
-        if '上游' in ln:
-            ticks = re.findall(r'`([^`]+)`', ln)
-            if len(ticks) >= 2:
-                return ticks[0].strip(), ticks[1].strip()
-            return None, None
-    return None, None
-
-
-def locate_by_name(project, name):
-    p = Path(project) / name
-    if p.exists():
-        return p
-    hits = list(Path(project).rglob(Path(name).name))
+def locate_by_name(project, name, base=None):
+    root = Path(project).resolve()
+    candidates = []
+    for parent in (Path(base) if base else root, root):
+        p = (parent / name).resolve()
+        if p.is_relative_to(root) and p.is_file():
+            candidates.append(p)
+    candidates = sorted(set(candidates))
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates and (Path(name).is_absolute() or Path(name).parent != Path('.')):
+        return None  # An explicit but wrong path must not fall back to a same-named file.
+    hits = [p for p in discover(root) if p.name == Path(name).name]
+    if len(candidates) > 1 or len(hits) > 1:
+        raise Blocked(f'上游文件名有歧义：{name}；请登记项目相对路径')
     return hits[0] if hits else None
 
 
-def gate_teaching(project, st):
+def relative_file(project, value):
+    root = Path(project).resolve()
+    # CLI paths are explicitly project-relative (absolute project files accepted).
+    p = (root / value).resolve()
+    if not p.is_relative_to(root) or not p.is_file():
+        raise Blocked(f'产物必须是项目内现存文件：{value}')
+    return p.relative_to(root).as_posix()
+
+
+def gate_intake(project, st):
     problems, notes = [], []
-    missing = []
-    for label, pat in TEACHING_ARTIFACTS:
-        if find_one(project, [pat, f'**/{pat}']):
-            notes.append(label)
-        else:
-            missing.append(label)
-    if missing:
-        problems.append('L3 缺失：' + '、'.join(missing))
-
-    # 交接核验：有编排方案就有义务把大纲转出来，且必须过严格校验。
-    # 少了这一步，L3 可能拿着自己另写的大纲往下做，Stage 4 的取舍就白排了。
-    plans = find_plans(project)
-    outlines = find_outlines(project)
-    if plans and not outlines:
-        problems.append('存在编排方案却没有课程大纲：Stage 4 → 5 的交接没做，'
-                        '先跑 plan_to_outline.py gen')
-    script = SKILLS / 'course-factory' / 'scripts' / 'plan_to_outline.py'
-    checked = 0
-    for o in outlines:
-        plan_name, comp_name = outline_upstream(o)
-        if not plan_name or not comp_name:
-            problems.append('%s 头部未登记上游，无法核验交接' % o.name)
-            continue
-        p = locate_by_name(project, plan_name)
-        c = locate_by_name(project, comp_name)
-        if p is None or c is None:
-            problems.append('%s 登记的上游文件找不到：%s / %s'
-                            % (o.name, plan_name, comp_name))
-            continue
-        if not script.exists():
-            notes.append('未找到 plan_to_outline.py，跳过交接核验')
-            break
-        proc = subprocess.run(
-            [sys.executable, str(script), 'verify', '--outline', str(o),
-             '--plan', str(p), '--components', str(c), '--strict'],
-            capture_output=True, text=True)
-        if proc.returncode == 0:
-            checked += 1
-        else:
-            problems.append('%s 未过 plan_to_outline 严格校验（退码 %d）'
-                            % (o.name, proc.returncode))
-    if checked:
-        notes.append('课程大纲 %d 份过 plan_to_outline 严格校验' % checked)
-
-    # 课程计划时间自洽（新增闸门）：分钟级排期最容易排错，且人眼查不出来——
-    # 本次实测就漏排过一个模块的 10 分钟。讲师按表上课，错 10 分钟就是一个单元讲不完。
-    sched = SKILLS / 'course-factory' / 'scripts' / 'check_schedule.py'
-    plans_found = find_all(project, '*课程计划*.md')
-    if plans_found and sched.exists():
-        done = 0
-        for pf in plans_found:
-            ol = outline_for(pf) or (find_outlines(project) or [None])[0]
-            if not ol:
-                notes.append('%s 找不到配对的大纲，跳过时间校验' % pf.name)
-                continue
-            proc = subprocess.run(
-                [sys.executable, str(sched), str(pf), '--outline', str(ol)],
-                capture_output=True, text=True)
-            if proc.returncode == 0:
-                done += 1
-            elif proc.returncode == 2:
-                notes.append('%s 时间校验无法判定（缺信息），未拦截' % pf.name)
-            else:
-                problems.append('%s 时间自洽未过（退码 %d）：%s'
-                                % (pf.name, proc.returncode,
-                                   (proc.stdout or '').strip().splitlines()[-1][:80]))
-        if done:
-            notes.append('课程计划 %d 份过时间自洽校验' % done)
-    elif plans_found:
-        notes.append('未找到 check_schedule.py，跳过时间校验')
-
-    # 跨文件口径一致性：单靠 check_schedule 看不见口径撕裂。
-    # 实际出过的事：计划按方案 A 排到 960（2天×480），大纲与需求说明书仍写
-    # 720（2天×360），而 check_schedule 只比对「实排 vs 大纲模块合计」——
-    # 两边恰好都是 720，于是 240 分钟的口径冲突整份放行。讲师第一天会排到
-    # 17:00，而学员通知单写的是每天 360 分钟。这不是排版错误，是交付事故。
-    cons = SKILLS / 'course-factory' / 'scripts' / 'check_consistency.py'
-    if plans_found and outlines and cons.exists():
-        proc = subprocess.run(
-            [sys.executable, str(cons), '--project', str(project)],
-            capture_output=True, text=True)
-        out = (proc.stdout or '') + (proc.stderr or '')
-        if proc.returncode == 0:
-            notes.append('交付口径跨文件一致（GROSS/NET/PERDAY 收敛）')
-        elif proc.returncode == 2:
-            notes.append('交付口径无法判定（未解析到权威源），未拦截')
-        else:
-            hits = [l.strip(' ❌') for l in out.splitlines() if l.strip().startswith('❌')]
-            problems.append('交付口径不一致（退码 %d）：%s'
-                            % (proc.returncode, '；'.join(hits)[:220]))
-    elif plans_found and outlines:
-        notes.append('未找到 check_consistency.py，跳过口径一致性校验')
+    try:
+        import yaml
+    except ImportError:
+        raise Blocked('接单校验需要 PyYAML，请使用资料整理器的独立 Python 环境')
+    prof = Path(st.get('profile') or '')
+    if not prof.is_file():
+        raise Blocked('未登记可读学员画像卡')
+    try:
+        profile = yaml.safe_load(read(prof))
+    except yaml.YAMLError as exc:
+        return ['画像 YAML 无效：' + str(exc)], notes
+    rules = profile.get('selection_rules') if isinstance(profile, dict) else None
+    if not isinstance(rules, list) or not rules:
+        problems.append('selection_rules 必须是非空规则列表')
+    else:
+        for number, rule in enumerate(rules, 1):
+            if not isinstance(rule, dict) or any(not isinstance(rule.get(k), str) or not rule[k].strip()
+                                                 for k in ('condition', 'action', 'reason')):
+                problems.append(f'规则{number}缺少 condition/action/reason')
+            elif rule['action'] not in {'promote', 'demote', 'drop'}:
+                problems.append(f'规则{number} action 非法')
+    src = Path(st.get('source') or '')
+    if not src.is_file():
+        raise Blocked(f'素材不是可读文件：{src}')
+    with src.open('rb') as handle:
+        if not handle.read(1024).strip():
+            problems.append('素材为空')
+    if st.get('copyright_stance') not in {'strict', 'relaxed'}:
+        problems.append('版权口径必须为 strict 或 relaxed')
+    if st.get('copyright_stance') == 'relaxed' and not st.get('copyright_note', '').strip():
+        problems.append('relaxed 必须写明理由；不自动豁免原文重合检查')
+    notes.append('按 YAML 结构与规则字段检查画像')
     return problems, notes
 
 
-def outline_for(plan_path):
-    """从课程计划头部的「上游」登记行取配对的大纲文件名。"""
-    head = io.open(plan_path, encoding='utf-8').read(3000)
-    for ln in head.splitlines():
-        if '上游' in ln:
-            for name in re.findall(r'`([^`]+)`', ln):
-                if '课程大纲' in name:
-                    p = plan_path.parent / name
-                    if p.exists():
-                        return p
-    return None
+def gate_extract(project, st):
+    frag = find_one(project, ['fragments.jsonl'], SKIP_FOR_DATA)
+    if not frag:
+        raise Blocked('未产出 fragments.jsonl')
+    errors, seen = [], set()
+    for number, line in enumerate(read(frag).splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError('记录必须是对象')
+            for key in ('fragment_id', 'source_id', 'revision_id', 'raw_text'):
+                if not isinstance(row.get(key), str) or not row[key].strip():
+                    raise ValueError(f'{key} 缺失或为空')
+            anchor = row.get('anchor')
+            if not isinstance(anchor, dict) or not anchor:
+                raise ValueError('缺少来源 anchor')
+            if row['fragment_id'] in seen:
+                raise ValueError('fragment_id 重复')
+            seen.add(row['fragment_id'])
+        except (ValueError, TypeError) as exc:
+            errors.append(f'第{number}条碎片无效：{exc}')
+    if not seen:
+        errors.append('没有有效碎片')
+    return errors, [f'有效碎片 {len(seen)} 条']
+
+
+def gate_restore(project, st):
+    path = find_one(project, ['chapters.json'], SKIP_FOR_DATA)
+    if not path:
+        raise Blocked('未产出 chapters.json')
+    blocks = json.loads(read(path))
+    if not isinstance(blocks, list) or len(blocks) < 2:
+        return ['章节数据须为至少两章的列表'], []
+    errors, previous = [], -1
+    for block in blocks:
+        if not isinstance(block, dict):
+            errors.append('章节记录不是对象')
+            continue
+        start, end, text = block.get('start_line'), block.get('end_line'), block.get('text')
+        if not isinstance(start, int) or not isinstance(end, int) or start <= previous or end <= start:
+            errors.append('章节行范围或顺序无效')
+        else:
+            previous = start
+        if not isinstance(text, str) or len(re.sub(r'\s', '', text)) < 200:
+            errors.append('章节正文不足 200 字，需检查是否误取目录')
+        elif block.get('chars') != len(re.sub(r'\s', '', text)):
+            errors.append('章节声明字数与实际文本不符')
+    return errors, [f'章节 {len(blocks)} 个']
+
+
+def run_script(script, args):
+    script = Path(script)
+    if not script.is_file():
+        raise Blocked(f'检查脚本不存在：{script}')
+    env = {**os.environ, 'PYTHONIOENCODING': 'utf-8', 'PYTHONUTF8': '1'}
+    try:
+        proc = subprocess.run([sys.executable, str(script), *map(str, args)],
+                              capture_output=True, text=True, encoding='utf-8',
+                              env=env, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Blocked(f'检查未完成：{exc}')
+    output = (proc.stdout or '') + (proc.stderr or '')
+    if proc.returncode == 2:
+        raise Blocked(output.strip() or f'{script.name} 无法判定')
+    return proc.returncode, output.strip()
+
+
+def outline_upstream(path):
+    names = upstream(path)
+    plan = [n for n in names if '编排方案' in n]
+    comp = [n for n in names if '组件清单' in n]
+    return (plan[0] if len(plan) == 1 else None, comp[0] if len(comp) == 1 else None)
+
+
+def gate_teaching(project, st):
+    errors, notes = [], []
+    try:
+        bundles = groups(project)
+    except (ValueError, OSError) as exc:
+        raise Blocked(str(exc))
+    for bundle in bundles:
+        for path in bundle.values():
+            text = read(path).strip()
+            if not text or re.search(r'【AI 补[:：]|待填写|尚未生成', text):
+                errors.append(f'{path.name} 为空或仍含未完成占位内容')
+        outline = bundle['课程大纲']
+        plan_name, comp_name = outline_upstream(outline)
+        if not plan_name or not comp_name:
+            raise Blocked(f'{outline.name} 未登记唯一上游编排方案和组件清单')
+        plan = locate_by_name(project, plan_name, outline.parent)
+        comp = locate_by_name(project, comp_name, outline.parent)
+        if not plan or not comp:
+            raise Blocked(f'{outline.name} 登记的上游文件缺失')
+        commands = [
+            ('plan_to_outline.py', ['verify', '--outline', outline, '--plan', plan, '--components', comp, '--strict']),
+            ('check_schedule.py', [bundle['课程计划'], '--outline', outline]),
+            ('check_consistency.py', ['--project', project, '--outline', outline, '--plan', bundle['课程计划'], *bundle.values()]),
+        ]
+        for script, args in commands:
+            code, out = run_script(SKILLS / 'course-factory' / 'scripts' / script, args)
+            if code:
+                errors.append(f'{outline.name} / {script} 未通过：\n{out}')
+            else:
+                notes.append(f'{outline.name} / {script} 已执行并通过')
+    return errors, notes
+
+
+def delivery_docs(project, st):
+    excluded = {Path(st[k]).resolve() for k in ('source', 'profile', 'source_text') if st.get(k)}
+    return [p for p in discover(project) if p.resolve() not in excluded]
 
 
 def gate_delivery(project, st):
-    """出厂闸门：文本卫生 + 版权扫描。
-
-    版权此前是「登记制」——只在文档头写一句「只用概括」，从不真查。
-    这道门把承诺变成可验证的动作：往交付物塞原文必须被拦下。
-    """
-    problems, notes = [], []
-    docs = [p for p in find_all(project, '*.md')]
+    docs = delivery_docs(project, st)
     if not docs:
-        return ['没有可出厂的交付物 md'], notes
-
-    hyg = SKILLS / 'course-factory' / 'scripts' / 'check_text_hygiene.py'
-    if hyg.exists():
-        proc = subprocess.run([sys.executable, str(hyg)] + [str(d) for d in docs],
-                              capture_output=True, text=True)
-        if proc.returncode == 0:
-            notes.append('文本卫生通过（%d 份交付物）' % len(docs))
-        else:
-            problems.append('文本卫生未过：%s'
-                            % ((proc.stdout or '').strip().splitlines()[-1][:100]))
-    else:
-        notes.append('未找到 check_text_hygiene.py，跳过卫生检查')
-
-    src = st.get('source')
-    srcp = None
-    if src:
-        cand = Path(src) if Path(src).is_absolute() else Path(project) / src
-        if cand.exists():
-            srcp = cand
-    if srcp is None:
-        # 原材料不可读时不算质量不合格，属条件不足——但必须明示，不许静默跳过
-        notes.append('⚠️ 原材料路径不可用，版权扫描未执行（init 时用 --source 指定）')
-        return problems, notes
-
-    cp = SKILLS / 'course-factory' / 'scripts' / 'check_copyright.py'
-    if not cp.exists():
-        notes.append('未找到 check_copyright.py，跳过版权扫描')
-        return problems, notes
-    proc = subprocess.run(
-        [sys.executable, str(cp), '--source', str(srcp)] + [str(d) for d in docs],
-        capture_output=True, text=True)
-    if proc.returncode == 0:
-        notes.append('版权扫描通过：未发现达到阈值的原文摘录')
-    else:
-        problems.append('版权扫描未过：交付物中发现疑似原文摘录，'
-                        '须改写为概括、或取得授权后加 copyright:allow 标记')
-
-    return problems, notes
+        raise Blocked('没有可交付的 Markdown 文件')
+    src = Path(st.get('source_text') or st.get('source') or '')
+    if not src.is_file():
+        raise Blocked('原材料文本不可用，版权检查未执行')
+    errors, notes = [], []
+    for name, args in (
+        ('check_text_hygiene.py', docs),
+        ('check_copyright.py', ['--source', src, *docs]),
+    ):
+        code, out = run_script(SKILLS / 'course-factory' / 'scripts' / name, args)
+        (errors if code else notes).append(f'{name}：\n{out}')
+    return errors, notes
 
 
-RULES = {'intake': gate_intake, 'extract': gate_extract,
-         'restore': gate_restore, 'teaching': gate_teaching,
-         'delivery': gate_delivery}
+RULES = {'intake': gate_intake, 'extract': gate_extract, 'restore': gate_restore,
+         'teaching': gate_teaching, 'delivery': gate_delivery}
 
 
-# ── 闸门参数解析 ──────────────────────────────────────────────────────────
 def resolve_script_args(project, st, kind):
-    """返回 (args, blocked_reason)。缺材料 → BLOCKED，不算失败。"""
+    comp = find_components_md(project)
+    if not comp:
+        return None, '未找到组件清单'
     if kind == 'components':
-        md = find_components_md(project)
-        if not md:
-            return None, '未找到组件清单 md（文件名需以「组件清单」开头）'
-        return [str(md)], None
-    if kind == 'modules':
-        comp = find_components_md(project)
-        if not comp:
-            return None, '未找到组件清单 md'
-        # 去重并保持顺序
-        plans, seen = [], set()
-        for p in find_plans(project):
-            if str(p) not in seen:
-                seen.add(str(p))
-                plans.append(p)
-        pair = st.get('compared_plans')
-        if pair:                       # 显式指定的一对优先，不猜
-            paths = [Path(project) / n for n in pair]
-            miss = [str(p) for p in paths if not p.exists()]
-            if miss:
-                return None, f'状态文件里登记的对照方案不存在：{miss}'
-        elif len(plans) >= 2:
-            paths = plans[:2]
-            print(f"  ⚠️  未显式指定对照组，按文件名顺序取了 {paths[0].name} 与 {paths[1].name}；"
-                  f"若这两份不是「同批组件 / 不同画像」，指标无意义。用 --plans A B 指定。")
-        else:
-            return None, f'双画像对照需 ≥2 份编排方案，当前 {len(plans)} 份'
-        st['compared_plans'] = [str(p.name) for p in paths]
-        return [str(paths[0]), str(paths[1]), str(comp)], None
-    if kind == 'delivery':
-        files = find_all(project, '*.md')
-        files = [f for f in files if f.name != STATE_NAME]
-        if not files:
-            return None, '无 md 交付物可扫'
-        st.setdefault('scanned_files', len(files))
-        return [str(f) for f in files], None
-    return None, f'未知参数类型 {kind}'
+        return [str(comp)], None
+    if kind != 'modules':
+        return None, '未知参数类型'
+    pair = st.get('compared_plans')
+    plans = [(Path(project) / n).resolve() for n in pair] if pair else find_plans(project)
+    if any(not p.is_file() or not p.is_relative_to(Path(project).resolve()) for p in plans):
+        return None, '登记的方案不存在或位于项目外'
+    single_reason = st.get('single_course_reason', '').strip()
+    if single_reason:
+        if len(plans) != 1:
+            return None, '单课程模式须恰好一份方案'
+        st['compared_plans'] = [relative_file(project, plans[0])]
+        return ['--single', str(plans[0]), str(comp)], None
+    if len(plans) != 2 or len(set(plans)) != 2:
+        return None, '需两份不同方案；有多个版本请用 --plans 明确选择，单课程须登记豁免理由'
+    st['compared_plans'] = [relative_file(project, p) for p in plans]
+    return [str(p) for p in plans] + [str(comp)], None
 
 
 def run_gate(project, st, stage):
-    """执行闸门，返回 ('pass'|'fail'|'blocked', 输出文本)"""
-    g = stage['gate']
-    if g['kind'] == 'rule':
-        problems, notes = RULES[g['fn']](project, st)
-        lines = [f'  · {n}' for n in notes]
-        if problems:
-            return 'fail', '\n'.join(lines + [f'  ❌ {p}' for p in problems])
-        return 'pass', '\n'.join(lines) if lines else '  (无附加检查项)'
-    script = SKILLS / g['script']
-    if not script.exists():
-        return 'blocked', f'  ⛔ 闸门脚本不存在：{script}'
-    args, reason = resolve_script_args(project, st, g.get('args', ''))
-    if args is None:
-        return 'blocked', f'  ⛔ {reason}'
-    proc = subprocess.run([sys.executable, str(script)] + args,
-                          capture_output=True, text=True, encoding='utf-8')
-    out = (proc.stdout or '') + (proc.stderr or '')
-    return ('pass' if proc.returncode == 0 else 'fail'), out.rstrip()
+    try:
+        gate = stage['gate']
+        if gate['kind'] == 'rule':
+            errors, notes = RULES[gate['fn']](project, st)
+            return ('fail' if errors else 'pass'), '\n'.join(notes + ['❌ ' + e for e in errors])
+        args, reason = resolve_script_args(project, st, gate['args'])
+        if args is None:
+            raise Blocked(reason)
+        code, out = run_script(SKILLS / gate['script'], args)
+        return ('pass' if code == 0 else 'fail'), out
+    except Blocked as exc:
+        return 'blocked', str(exc)
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError) as exc:
+        return 'fail', f'输入/解析错误：{exc}'
 
 
-# ── 命令实现 ──────────────────────────────────────────────────────────────
+def stage_by_id(sid):
+    return next((stage for stage in STAGES if sid in (stage['id'], stage['name'])), None)
+
+
 def sync_pointer(st):
-    """指针自愈：永远指向第一个未通过闸门的阶段。
+    st['current'] = next((sid for sid in STAGE_IDS if st['stages'][sid]['status'] != 'passed'), STAGE_IDS[-1])
 
-    为什么不用「检查了谁就推进到谁」：实际跑流水线常常是乱序的
-    （先补跑某个历史阶段的闸门、或上游返工后重跑），那种写法会把指针卡死在
-    起始阶段。按状态推导反而稳定。
-    """
+
+def invalidate(st, sid, reason):
+    for affected in STAGE_IDS[STAGE_IDS.index(sid):]:
+        info = st['stages'][affected]
+        info.update(status='pending', gate=None)
+        info.pop('fingerprint', None)
+    sync_pointer(st)
+    log(st, f'invalidate {sid} 及下游：{reason}')
+
+
+def fingerprint(project, st, sid):
+    patterns = {
+        '1-extract': ['fragments.jsonl', 'sources.jsonl'],
+        '2-restore': ['chapters.json'],
+        '3-components': ['组件清单*.md'],
+        '4-modules': ['编排方案*.md'],
+    }
+    files = []
+    config = {}
+    if sid == '0-intake':
+        files = [Path(st[k]) for k in ('source', 'profile', 'source_text') if st.get(k)]
+        config = {k: st.get(k) for k in ('copyright_stance', 'copyright_note')}
+    elif sid in patterns:
+        files = [p for pattern in patterns[sid] for p in find_all(project, pattern, SKIP_FOR_DATA)]
+        if sid == '1-extract':
+            files.extend(p for p in find_all(project, '*', SKIP_FOR_DATA)
+                         if 'derived' in p.relative_to(Path(project).resolve()).parts)
+        if sid == '4-modules':
+            config = {k: st.get(k) for k in ('compared_plans', 'single_course_reason')}
+    else:
+        files = delivery_docs(project, st) if sid == '6-delivery' else [
+            p for p in discover(project) if any(tag in p.name for tag, _ in TEACHING_ARTIFACTS)
+            or '课程计划' in p.name or 'Storyboard' in p.name or '学员课程讲义' in p.name
+            or '教员课程指导手册' in p.name]
+        manifest = Path(project) / 'course-deliverables.json'
+        if manifest.exists():
+            files.append(manifest)
+    config['artifacts'] = st['stages'][sid].get('artifacts', [])
+    values = []
+    for p in sorted(set(files)):
+        values.append((str(p.resolve()), hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else 'MISSING'))
+    # Checker upgrades invalidate old passes, including legacy states without fingerprints.
+    checker_files = [Path(__file__), *(SKILLS / 'course-factory' / 'scripts').glob('*.py')]
+    tools_hash = [(p.name, hashlib.sha256(p.read_bytes()).hexdigest()) for p in sorted(checker_files)
+                  if not p.name.startswith(('test_', 'selftest_'))]
+    return hashlib.sha256(json.dumps([values, config, tools_hash], sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
+def refresh(project, st):
     for sid in STAGE_IDS:
-        if st['stages'][sid]['status'] != 'passed':
-            st['current'] = sid
-            return
-    st['current'] = STAGE_IDS[-1]
+        info = st['stages'][sid]
+        if info['status'] == 'passed':
+            try:
+                fresh = info.get('fingerprint') == fingerprint(project, st, sid)
+            except OSError:
+                fresh = False
+            if not fresh:
+                invalidate(st, sid, '文件/配置变更或旧版状态缺少校验指纹')
+                return True
+    old = st.get('current')
+    sync_pointer(st)
+    return old != st['current']
+
+
+def prerequisite(st, sid):
+    needed = [prior for prior in STAGE_IDS[:STAGE_IDS.index(sid)] if st['stages'][prior]['status'] != 'passed']
+    if needed:
+        raise Blocked('前置阶段尚未通过：' + ', '.join(needed))
 
 
 def cmd_init(a):
+    project = Path(a.project).resolve()
+    project.mkdir(parents=True, exist_ok=True)
+    if state_path(project).exists():
+        raise Blocked('已有状态文件；请使用 status/check/reset，不覆盖历史')
     st = {
-        'project': a.project,
-        'source': a.source,
-        'profile': a.profile,
-        'copyright_stance': a.copyright,
-        'copyright_note': a.note or '',
+        'schema_version': 2, 'project': str(project),
+        'source': str(Path(a.source).expanduser().resolve()),
+        'profile': str(Path(a.profile).expanduser().resolve()) if a.profile else None,
+        'source_text': str(Path(a.source_text).expanduser().resolve()) if getattr(a, 'source_text', None) else None,
+        'copyright_stance': a.copyright, 'copyright_note': a.note or '',
+        'single_course_reason': getattr(a, 'single_course_reason', None) or '',
         'created_at': datetime.now().isoformat(timespec='seconds'),
-        'updated_at': '',
-        'current': STAGE_IDS[0],
-        'stages': {sid: {'status': 'pending', 'artifacts': [], 'gate': None}
-                   for sid in STAGE_IDS},
-        'history': [],
+        'current': STAGE_IDS[0], 'history': [],
+        'stages': {sid: {'status': 'pending', 'artifacts': [], 'gate': None} for sid in STAGE_IDS},
     }
-    Path(a.project).mkdir(parents=True, exist_ok=True)
+    result, out = run_gate(project, st, STAGES[0])
+    st['stages'][STAGE_IDS[0]].update(status={'pass': 'passed', 'fail': 'failed', 'blocked': 'blocked'}[result],
+                                     gate={'result': result, 'detail': out})
+    if result == 'pass':
+        st['stages'][STAGE_IDS[0]]['fingerprint'] = fingerprint(project, st, STAGE_IDS[0])
     log(st, 'init')
-    # init 后立即校验接单条件，条件不足当场说清
-    res, out = run_gate(a.project, st, STAGES[0])
-    st['stages'][STAGE_IDS[0]].update({
-        'gate': {'result': res, 'detail': out},
-        'status': {'pass': 'passed', 'fail': 'failed', 'blocked': 'blocked'}[res],
-    })
-    save_state(a.project, st)
-    print(f'已初始化：{state_path(a.project)}')
-    print(f"版权口径：{a.copyright}" + (f"（{a.note}）" if a.note else ''))
-    print('\n接单校验：')
-    print(out if out.strip() else '  ✅ 通过')
-    print('\n下一步：填入缺失项后跑  python pipeline.py check 0-intake')
-    sys.exit(0 if res == 'pass' else (2 if res == 'blocked' else 1))
+    sync_pointer(st)
+    save_state(project, st)
+    print(out)
+    print(f'已初始化：{state_path(project)}；当前阶段 {st["current"]}')
+    return {'pass': 0, 'fail': 1, 'blocked': 2}[result]
 
 
 def cmd_status(a):
     st, _ = load_state(a.project)
-    print(f"项目：{st['project']}")
-    print(f"素材：{st['source']}")
-    print(f"画像：{st.get('profile') or '（未登记）'}")
-    print(f"版权：{st.get('copyright_stance')} {st.get('copyright_note') or ''}")
-    print(f"当前阶段：{st['current']}    更新于 {st['updated_at']}")
-    print()
-    buf = []
-    print(f"{'阶段':<16}{'状态':<10}{'闸门':<8}  产出")
-    print('-' * 76)
-    for s in STAGES:
-        info = st['stages'][s['id']]
-        g = info.get('gate') or {}
-        print(f"{s['id']:<17}{info['status']:<10}{(g.get('result') or '-'):<9} {s['out']}")
-        if s['id'] == st['current']:
-            buf.append(f"  ↑ 当前位置：{s['name']}（执行者 {s['owner']}）")
-    print('-' * 76)
-    for ln in buf:
-        print(ln)
+    print('项目：' + st['project'])
+    for sid in STAGE_IDS:
+        info = st['stages'][sid]
+        print(f'{sid}: {info["status"]}')
+    print('当前阶段：' + st['current'])
     if a.detail:
-        print('\n最近操作：')
-        for h in st.get('history', [])[-10:]:
-            print(f"  {h['ts']}  {h['action']}")
-    sys.exit(0)
-
-
-def stage_by_id(sid):
-    for s in STAGES:
-        if s['id'] == sid or s['name'] == sid:
-            return s
-    return None
+        for item in st.get('history', [])[-10:]:
+            print(item['ts'], item['action'])
+    return 0
 
 
 def cmd_enter(a):
     st, _ = load_state(a.project)
-    s = stage_by_id(a.stage)
-    if not s:
-        print(f'[FATAL] 未知阶段 {a.stage}，可选：{STAGE_IDS}')
-        sys.exit(2)
-    st['current'] = s['id']
-    st['stages'][s['id']]['status'] = 'running'
-    log(st, f"enter {s['id']}")
+    stage = stage_by_id(a.stage)
+    if not stage:
+        raise Blocked('未知阶段')
+    sid = stage['id']
+    prerequisite(st, sid)
+    invalidate(st, sid, '重新进入该阶段')
+    st['stages'][sid]['status'] = 'running'
     save_state(a.project, st)
-    print(f"进入 {s['id']}（{s['name']}）—— 执行者 {s['owner']}")
-    print(f"本阶段产出应为：{s['out']}")
-    sys.exit(0)
+    print('进入 ' + sid)
+    return 0
 
 
 def cmd_artifact(a):
     st, _ = load_state(a.project)
-    s = stage_by_id(a.stage)
-    if not s:
-        print(f'[FATAL] 未知阶段 {a.stage}')
-        sys.exit(2)
-    for p in a.paths:
-        rel = Path(p).name
-        if rel not in st['stages'][s['id']]['artifacts']:
-            st['stages'][s['id']]['artifacts'].append(rel)
-    log(st, f"artifact {s['id']}: {','.join(Path(p).name for p in a.paths)}")
+    stage = stage_by_id(a.stage)
+    if not stage:
+        raise Blocked('未知阶段')
+    sid = stage['id']
+    paths = [relative_file(a.project, value) for value in a.paths]
+    invalidate(st, sid, '产物登记发生变化')
+    st['stages'][sid]['artifacts'] = sorted(set(st['stages'][sid].get('artifacts', []) + paths))
     save_state(a.project, st)
-    print(f"已登记 {s['id']} 的产物：{st['stages'][s['id']]['artifacts']}")
-    sys.exit(0)
+    return 0
 
 
 def cmd_check(a):
     st, _ = load_state(a.project)
-    s = stage_by_id(a.stage)
-    if not s:
-        print(f'[FATAL] 未知阶段 {a.stage}')
-        sys.exit(2)
-    print(f"闸门 · {s['id']}（{s['name']}）")
-    print('=' * 76)
-    if a.plans:
-        st['compared_plans'] = [Path(x).name for x in a.plans]
-        print(f"对照组：{st['compared_plans'][0]}  ×  {st['compared_plans'][1]}")
-    res, out = run_gate(a.project, st, s)
-    print(out if out.strip() else '  (闸门无输出)')
-    print('=' * 76)
-    st['stages'][s['id']]['gate'] = {'result': res,
-                                     'detail': out[:2000],
-                                     'at': datetime.now().isoformat(timespec='seconds')}
-    st['stages'][s['id']]['status'] = {'pass': 'passed', 'fail': 'failed',
-                                       'blocked': 'blocked'}[res]
-    log(st, f"check {s['id']} → {res}")
-    # 过闸或没过闸，指针都按实际状态重算，避免乱序跑闸门时卡死。
-    # 必须在 save_state 之前同步——曾经先存后算，改完没落盘，等于没改。
+    stage = stage_by_id(a.stage)
+    if not stage:
+        raise Blocked('未知阶段')
+    sid = stage['id']
+    prerequisite(st, sid)
+    if getattr(a, 'plans', None):
+        st['compared_plans'] = [relative_file(a.project, p) for p in a.plans]
+    if getattr(a, 'single_course_reason', None):
+        st['single_course_reason'] = a.single_course_reason.strip()
+    invalidate(st, sid, '重新执行检查')
+    result, out = run_gate(a.project, st, stage)
+    info = st['stages'][sid]
+    info.update(status={'pass': 'passed', 'fail': 'failed', 'blocked': 'blocked'}[result],
+                gate={'result': result, 'detail': out, 'at': datetime.now().isoformat(timespec='seconds')})
+    if result == 'pass':
+        info['fingerprint'] = fingerprint(a.project, st, sid)
+    log(st, f'check {sid} → {result}')
     sync_pointer(st)
     save_state(a.project, st)
-    if res == 'pass':
-        idx = STAGE_IDS.index(s['id'])
-        nxt = STAGE_IDS[idx + 1] if idx + 1 < len(STAGE_IDS) else None
-        print(f"✅ 放行" + (f"　下一步：{nxt}" if nxt else "　全流水线通过"))
-        sys.exit(0)
-    if res == 'blocked':
-        print(f"⛔ 条件不足（不是失败）：补齐材料后重跑 python pipeline.py check {s['id']}")
-        sys.exit(2)
-    print(f"❌ 未通过 —— 不许进入下一阶段，退回 {s['id']} 返工")
-    sys.exit(1)
+    print(out)
+    complete = all(v['status'] == 'passed' for v in st['stages'].values())
+    print('全流水线通过（程序检查，不代表教学效果验收）' if complete else f'{sid}: {result}；当前阶段 {st["current"]}')
+    return {'pass': 0, 'fail': 1, 'blocked': 2}[result]
 
 
 def cmd_advance(a):
     st, _ = load_state(a.project)
-    idx = STAGE_IDS.index(st['current'])
-    cur = st['stages'][st['current']]
-    if cur['status'] != 'passed':
-        print(f"[FATAL] {st['current']} 尚未通过闸门（当前 {cur['status']}），不许推进")
-        print(f"先跑：python pipeline.py check {st['current']}")
-        sys.exit(1)
-    if idx + 1 >= len(STAGE_IDS):
-        print('已在末阶段，流水线完成')
-        sys.exit(0)
-    nxt = STAGE_IDS[idx + 1]
-    st['current'] = nxt
-    st['stages'][nxt]['status'] = 'running'
-    log(st, f"advance → {nxt}")
+    sid = st['current']
+    if all(v['status'] == 'passed' for v in st['stages'].values()):
+        print('全部阶段已通过')
+        return 0
+    prerequisite(st, sid)
+    if st['stages'][sid]['status'] not in {'pending', 'running'}:
+        raise Blocked(f'{sid} 需修复并重检，不可跳过')
+    st['stages'][sid]['status'] = 'running'
+    log(st, 'advance/start ' + sid)
     save_state(a.project, st)
-    s = stage_by_id(nxt)
-    print(f"推进到 {nxt}（{s['name']}）—— 执行者 {s['owner']}")
-    print(f"本阶段产出应为：{s['out']}")
-    sys.exit(0)
+    print('开始当前待办阶段：' + sid)
+    return 0
 
 
 def cmd_reset(a):
     st, _ = load_state(a.project)
-    s = stage_by_id(a.stage)
-    if not s:
-        print(f'[FATAL] 未知阶段 {a.stage}')
-        sys.exit(2)
-    st['stages'][s['id']] = {'status': 'pending', 'artifacts': [], 'gate': None}
-    st['current'] = s['id']
-    log(st, f"reset {s['id']}")
+    stage = stage_by_id(a.stage)
+    if not stage:
+        raise Blocked('未知阶段')
+    invalidate(st, stage['id'], '用户重置')
     save_state(a.project, st)
-    print(f"已重置 {s['id']}，当前指针回到该阶段")
-    sys.exit(0)
+    print('已重置指定阶段及全部下游，产物文件保留')
+    return 0
 
 
 def main():
-    ap = argparse.ArgumentParser(description='课程流水线总控状态机')
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8')
+    ap = argparse.ArgumentParser(description='课程总控：缺输入阻断、检查失败不放行、上游变化使下游失效')
     sub = ap.add_subparsers(dest='cmd', required=True)
-
-    p = sub.add_parser('init', help='初始化流水线状态')
+    p = sub.add_parser('init')
     p.add_argument('--project', required=True)
     p.add_argument('--source', required=True)
-    p.add_argument('--profile', default=None)
+    p.add_argument('--profile')
+    p.add_argument('--source-text', help='PDF 等素材用于版权比对的派生文本')
     p.add_argument('--copyright', default='strict', choices=['strict', 'relaxed'])
-    p.add_argument('--note', default=None, help='relaxed 时必须写明理由')
+    p.add_argument('--note', default='')
+    p.add_argument('--single-course-reason', help='仅制作一门课时明确登记不做双画像对照的理由')
     p.set_defaults(fn=cmd_init)
-
-    p = sub.add_parser('status', help='查看流水线状态')
-    p.add_argument('--project', required=True)
-    p.add_argument('--detail', action='store_true')
-    p.set_defaults(fn=cmd_status)
-
-    p = sub.add_parser('enter', help='进入某阶段')
-    p.add_argument('--project', required=True)
-    p.add_argument('stage')
-    p.set_defaults(fn=cmd_enter)
-
-    p = sub.add_parser('artifact', help='登记某阶段的产物')
-    p.add_argument('--project', required=True)
-    p.add_argument('stage')
-    p.add_argument('paths', nargs='+')
-    p.set_defaults(fn=cmd_artifact)
-
-    p = sub.add_parser('check', help='跑某阶段闸门')
-    p.add_argument('--project', required=True)
-    p.add_argument('stage')
-    p.add_argument('--plans', nargs=2, default=None, metavar=('A', 'B'),
-                   help='4-modules 闸门用：显式指定参与对照的两份编排方案')
-    p.set_defaults(fn=cmd_check)
-
-    p = sub.add_parser('advance', help='推进到下一阶段（要求当前已过闸）')
-    p.add_argument('--project', required=True)
-    p.set_defaults(fn=cmd_advance)
-
-    p = sub.add_parser('reset', help='重置某阶段')
-    p.add_argument('--project', required=True)
-    p.add_argument('stage')
-    p.set_defaults(fn=cmd_reset)
-
-    args = ap.parse_args()
-    args.fn(args)
+    for name, fn in (('status', cmd_status), ('enter', cmd_enter), ('artifact', cmd_artifact),
+                     ('check', cmd_check), ('advance', cmd_advance), ('reset', cmd_reset)):
+        p = sub.add_parser(name)
+        p.add_argument('--project', required=True)
+        if name in {'enter', 'artifact', 'check', 'reset'}:
+            p.add_argument('stage', choices=STAGE_IDS)
+        if name == 'status':
+            p.add_argument('--detail', action='store_true')
+        if name == 'artifact':
+            p.add_argument('paths', nargs='+')
+        if name == 'check':
+            p.add_argument('--plans', nargs='+', help='项目相对路径：对照两份；已登记单课程模式时一份')
+            p.add_argument('--single-course-reason')
+        p.set_defaults(fn=fn)
+    a = ap.parse_args()
+    a.project = str(Path(a.project).expanduser().resolve())
+    try:
+        return a.fn(a)
+    except Blocked as exc:
+        print('BLOCKED：' + str(exc))
+        return 2
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError) as exc:
+        print('FAILED：' + str(exc))
+        return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

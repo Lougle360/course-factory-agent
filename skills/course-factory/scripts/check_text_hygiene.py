@@ -152,8 +152,8 @@ def scan(path, check_words=True):
     try:
         with open(path, "r", encoding="utf-8") as f:
             lines = f.read().splitlines()
-    except FileNotFoundError:
-        return [(0, "FATAL", "文件不存在", "")]
+    except (OSError, UnicodeError) as exc:
+        return [(0, "FATAL", "文件不可读", str(exc))]
     for lineno, ln in enumerate(lines, 1):
         # 显式豁免：文档里要举例说明"什么是乱码"时，那行本身必须允许写乱码
         if EXEMPT_MARKER in ln:
@@ -182,7 +182,7 @@ def main():
         if not fs:
             print(f"[OK]   {name}")
             continue
-        fails = [f for f in fs if f[1] == "FAIL"]
+        fails = [f for f in fs if f[1] in {"FAIL", "FATAL"}]
         warns = [f for f in fs if f[1] == "WARN"]
         total_fail += len(fails)
         total_warn += len(warns)

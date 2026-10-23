@@ -42,6 +42,7 @@ import os
 import re
 import sys
 from collections import Counter, OrderedDict
+from pathlib import Path
 
 # ── 组件类型 → 大纲「原材料地图」的分类映射 ──────────────────
 TYPE_TO_MATERIAL = [
@@ -94,7 +95,7 @@ def load_trunk(path):
     为什么要单独解析这一段：逐章明细里对主干组件只写「见上文」「见主干表」，
     不回填的话，生成的大纲里这些组件的核心内容就是一句空话。
     """
-    lines = io.open(path, encoding="utf-8").read().split("\n")
+    lines = Path(path).read_text(encoding="utf-8-sig").split("\n")
     start = end = None
     for i, ln in enumerate(lines):
         if re.match(r"^#{2,3}\s*二[、\.]", ln.strip()):
@@ -125,7 +126,7 @@ def load_components(path):
     """
     if not os.path.isfile(path):
         return None, "组件清单不存在：%s" % path
-    lines = io.open(path, encoding="utf-8").read().split("\n")
+    lines = Path(path).read_text(encoding="utf-8-sig").split("\n")
 
     start = None
     for i, ln in enumerate(lines):
@@ -152,6 +153,8 @@ def load_components(path):
         row = _split_row(ln)
         if not row or _is_table_sep(ln):
             continue
+        if row[0] == 'ID' and len(row) > 4 and ('定位' in row[4] or row[4].lower() == 'locator'):
+            return None, '逐章组件明细第五列应为教学价值；定位请放第六列（参见 references/runtime-contract.md）'
         if len(row) < 4:
             continue
         cid = row[0]
@@ -189,7 +192,7 @@ def load_plan(path):
     """解析编排方案：立意、模块序列、关键决策、未选用清单、课时配比。"""
     if not os.path.isfile(path):
         return None, "编排方案不存在：%s" % path
-    txt = io.open(path, encoding="utf-8").read()
+    txt = Path(path).read_text(encoding="utf-8-sig")
     lines = txt.split("\n")
 
     plan = {
@@ -289,7 +292,7 @@ def load_profile(path):
     """
     if not os.path.isfile(path):
         return None, "画像卡不存在：%s" % path
-    raw = io.open(path, encoding="utf-8").read().split("\n")
+    raw = Path(path).read_text(encoding="utf-8-sig").split("\n")
 
     lines = []
     for ln in raw:
@@ -496,9 +499,9 @@ def render_outline(plan, comps, profile, src_paths):
     A("")
     A("> **生成方式**：由 `plan_to_outline.py` 从编排方案自动转换为大纲骨架。")
     A("> **上游**：`%s` + `%s` + `%s`" % (
-        os.path.basename(src_paths["plan"]),
-        os.path.basename(src_paths["components"]),
-        os.path.basename(src_paths["profile"])))
+        src_paths["plan"],
+        src_paths["components"],
+        src_paths["profile"]))
     A("> **状态**：骨架已由脚本算定，凡方括号标记处需由 AI 补写，补齐后需重跑 `verify`。")
     A("")
     A("> ⛔ **版权约束继承**：本大纲全部内容为整理者概括，不含原文摘录；"
@@ -576,7 +579,9 @@ def render_outline(plan, comps, profile, src_paths):
     A("")
     A("| 项 | 值 |")
     A("|---|---|")
-    A("| 建议时长 | %d 分钟（%s）|" % (total, layout))
+    A("| 教学净时长 | %d 分钟 |" % total)
+    A("| 总时长 | %s" % (TODO_PREFIX + "确认含休息的总包时长，写 N 分钟，并与课程计划一致】|"))
+    A("| 画像时间安排 | %s |" % layout)
     A("| 模块数 | %d 个 |" % n_mod)
     A("| 选用组件 | %d / %d |" % (len(used_ids), len(comps)))
     A("| 培训形式 | %s" % (TODO_PREFIX + "线下工作坊 / 线上直播 / 混合】|"))
@@ -842,6 +847,16 @@ def verify(outline_text, plan, comps):
     """
     problems, notes = [], []
 
+    assigned = [cid for module in plan['modules'] for cid in module['comps']]
+    unused_ids = set(plan['unused'])
+    orphaned = set(comps) - set(assigned) - unused_ids
+    if orphaned:
+        problems.append('组件未在方案中交代去向：' + '、'.join(sorted(orphaned)))
+    if unused_ids.intersection(assigned):
+        problems.append('组件同时被选用和列入未选用清单')
+    if (set(assigned) | unused_ids) - set(comps):
+        problems.append('方案引用组件清单以外的编号')
+
     # 1. 十三个小节齐全
     need = ["一、课程名称", "二、课程定位", "三、适用对象", "四、课程基本信息",
             "五、业务与学习背景", "六、课程原材料地图", "七、能力差距",
@@ -868,6 +883,29 @@ def verify(outline_text, plan, comps):
         problems.append("大纲多出模块：%s" % "、".join(extra))
     if not lost and not extra:
         notes.append("模块一一对应（%d 个）" % len(plan_ids))
+    if list(in_outline) != plan_ids:
+        problems.append("模块顺序与编排方案不一致")
+
+    # Compare each module, not only the union of component IDs and total time.
+    module_blocks = re.findall(
+        r"^###\s*(M\d+)\s*·\s*([^\n]+)\n(.*?)(?=^###\s*M\d+\s*·|^####\s*附：未选用|^##\s|\Z)",
+        outline_text, re.M | re.S)
+    if len(module_blocks) != len(in_outline):
+        problems.append("模块标题重复或无法唯一解析")
+    actual_modules = {mid: (head, body) for mid, head, body in module_blocks}
+    for module in plan['modules']:
+        if module['id'] not in actual_modules:
+            continue
+        head, body = actual_modules[module['id']]
+        landed_here = re.findall(r'^\|\s*(C\d{3})\b', body, re.M)
+        if set(landed_here) != set(module['comps']) or len(landed_here) != len(set(landed_here)):
+            problems.append('%s 组件归属与编排方案不一致' % module['id'])
+        duration = re.search(r'[（(]\s*(Know|Do|Act)\s*[，,]\s*(\d+)\s*分钟', head)
+        if not duration or (duration.group(1), int(duration.group(2))) != (module['level'], module['minutes']):
+            problems.append('%s 层级或时长与编排方案不一致' % module['id'])
+        declared_here = re.findall(r'建议时长\*\*：\s*(\d+)\s*分钟', body)
+        if not declared_here or any(int(value) != module['minutes'] for value in declared_here):
+            problems.append('%s 缺少有效的逐模块建议时长或与方案不符' % module['id'])
 
     # 3. 模块名一致（防改名）
     name_map = {m["id"]: m["name"] for m in plan["modules"]}
@@ -918,10 +956,21 @@ def verify(outline_text, plan, comps):
 
     # 7. 未选用组件必须交代去向
     if plan["unused"]:
-        if "未选用组件的去向" not in outline_text:
-            problems.append("方案有 %d 个未选用组件，大纲里没有交代去向"
-                            % len(plan["unused"]))
-        else:
+        unused_section = re.search(r'^####\s*附：未选用组件的去向[^\n]*\n(.*?)(?=^---|^##\s|\Z)', outline_text, re.M | re.S)
+        actual_unused = {}
+        for line in unused_section.group(1).splitlines() if unused_section else []:
+            row = _split_row(line)
+            if row and re.fullmatch(r'C\d{3}', row[0]):
+                if row[0] in actual_unused:
+                    problems.append('未选用组件去向重复：' + row[0])
+                actual_unused[row[0]] = row
+        if set(actual_unused) != set(plan['unused']):
+            problems.append('未选用组件去向记录缺失或多出')
+        for cid, expected in plan['unused'].items():
+            row = actual_unused.get(cid, [])
+            if len(row) < 5 or row[3] != expected['dest'] or not row[4].strip():
+                problems.append(cid + ' 未交代有效去向和理由，或去向与方案不符')
+        if unused_section and not any('去向' in problem for problem in problems):
             notes.append("未选用组件 %d 个已交代去向" % len(plan["unused"]))
 
     # 8. 待补项统计（默认提示，strict 时才算失败）
@@ -974,11 +1023,14 @@ def main():
         if err:
             print("[输入不可用] " + err)
             sys.exit(2)
-        src = {"plan": a.plan, "components": a.components, "profile": a.profile}
+        output = Path(a.out).resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        src = {key: os.path.relpath(Path(value).resolve(), output.parent).replace(os.sep, '/')
+               for key, value in {"plan": a.plan, "components": a.components, "profile": a.profile}.items()}
         text = render_outline(plan, comps, profile, src)
-        io.open(a.out, "w", encoding="utf-8").write(text)
+        Path(a.out).write_text(text, encoding="utf-8")
         print("已生成：%s" % a.out)
-        print("  模块 %d 个 · 选用组件 %d 个 · 总时长 %d 分钟"
+        print("  模块 %d 个 · 选用组件 %d 个 · 教学净时长 %d 分钟"
               % (len(plan["modules"]),
                  len(set(c for m in plan["modules"] for c in m["comps"])),
                  plan["total_min"]))
@@ -986,7 +1038,7 @@ def main():
         if not os.path.isfile(outline_path):
             print("[输入不可用] 大纲不存在：%s" % outline_path)
             sys.exit(2)
-        text = io.open(outline_path, encoding="utf-8").read()
+        text = Path(outline_path).read_text(encoding="utf-8-sig")
         print("校验：%s" % outline_path)
 
     problems, notes, todos = verify(text, plan, comps)
