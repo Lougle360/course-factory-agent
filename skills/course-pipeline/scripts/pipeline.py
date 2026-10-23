@@ -63,8 +63,8 @@ STAGES = [
     },
     {
         'id': '6-delivery', 'name': '出厂', 'owner': 'course-pipeline',
-        'out': '全部交付物过卫生与版权抽查',
-        'gate': {'kind': 'script', 'script': 'course-factory/scripts/check_text_hygiene.py', 'args': 'delivery'},
+        'out': '全部交付物过文本卫生 + 版权扫描',
+        'gate': {'kind': 'rule', 'fn': 'delivery'},
     },
 ]
 STAGE_IDS = [s['id'] for s in STAGES]
@@ -289,11 +289,102 @@ def gate_teaching(project, st):
                             % (o.name, proc.returncode))
     if checked:
         notes.append('课程大纲 %d 份过 plan_to_outline 严格校验' % checked)
+
+    # 课程计划时间自洽（新增闸门）：分钟级排期最容易排错，且人眼查不出来——
+    # 本次实测就漏排过一个模块的 10 分钟。讲师按表上课，错 10 分钟就是一个单元讲不完。
+    sched = SKILLS / 'course-factory' / 'scripts' / 'check_schedule.py'
+    plans_found = find_all(project, '*课程计划*.md')
+    if plans_found and sched.exists():
+        done = 0
+        for pf in plans_found:
+            ol = outline_for(pf) or (find_outlines(project) or [None])[0]
+            if not ol:
+                notes.append('%s 找不到配对的大纲，跳过时间校验' % pf.name)
+                continue
+            proc = subprocess.run(
+                [sys.executable, str(sched), str(pf), '--outline', str(ol)],
+                capture_output=True, text=True)
+            if proc.returncode == 0:
+                done += 1
+            elif proc.returncode == 2:
+                notes.append('%s 时间校验无法判定（缺信息），未拦截' % pf.name)
+            else:
+                problems.append('%s 时间自洽未过（退码 %d）：%s'
+                                % (pf.name, proc.returncode,
+                                   (proc.stdout or '').strip().splitlines()[-1][:80]))
+        if done:
+            notes.append('课程计划 %d 份过时间自洽校验' % done)
+    elif plans_found:
+        notes.append('未找到 check_schedule.py，跳过时间校验')
+    return problems, notes
+
+
+def outline_for(plan_path):
+    """从课程计划头部的「上游」登记行取配对的大纲文件名。"""
+    head = io.open(plan_path, encoding='utf-8').read(3000)
+    for ln in head.splitlines():
+        if '上游' in ln:
+            for name in re.findall(r'`([^`]+)`', ln):
+                if '课程大纲' in name:
+                    p = plan_path.parent / name
+                    if p.exists():
+                        return p
+    return None
+
+
+def gate_delivery(project, st):
+    """出厂闸门：文本卫生 + 版权扫描。
+
+    版权此前是「登记制」——只在文档头写一句「只用概括」，从不真查。
+    这道门把承诺变成可验证的动作：往交付物塞原文必须被拦下。
+    """
+    problems, notes = [], []
+    docs = [p for p in find_all(project, '*.md')]
+    if not docs:
+        return ['没有可出厂的交付物 md'], notes
+
+    hyg = SKILLS / 'course-factory' / 'scripts' / 'check_text_hygiene.py'
+    if hyg.exists():
+        proc = subprocess.run([sys.executable, str(hyg)] + [str(d) for d in docs],
+                              capture_output=True, text=True)
+        if proc.returncode == 0:
+            notes.append('文本卫生通过（%d 份交付物）' % len(docs))
+        else:
+            problems.append('文本卫生未过：%s'
+                            % ((proc.stdout or '').strip().splitlines()[-1][:100]))
+    else:
+        notes.append('未找到 check_text_hygiene.py，跳过卫生检查')
+
+    src = st.get('source')
+    srcp = None
+    if src:
+        cand = Path(src) if Path(src).is_absolute() else Path(project) / src
+        if cand.exists():
+            srcp = cand
+    if srcp is None:
+        # 原材料不可读时不算质量不合格，属条件不足——但必须明示，不许静默跳过
+        notes.append('⚠️ 原材料路径不可用，版权扫描未执行（init 时用 --source 指定）')
+        return problems, notes
+
+    cp = SKILLS / 'course-factory' / 'scripts' / 'check_copyright.py'
+    if not cp.exists():
+        notes.append('未找到 check_copyright.py，跳过版权扫描')
+        return problems, notes
+    proc = subprocess.run(
+        [sys.executable, str(cp), '--source', str(srcp)] + [str(d) for d in docs],
+        capture_output=True, text=True)
+    if proc.returncode == 0:
+        notes.append('版权扫描通过：未发现达到阈值的原文摘录')
+    else:
+        problems.append('版权扫描未过：交付物中发现疑似原文摘录，'
+                        '须改写为概括、或取得授权后加 copyright:allow 标记')
+
     return problems, notes
 
 
 RULES = {'intake': gate_intake, 'extract': gate_extract,
-         'restore': gate_restore, 'teaching': gate_teaching}
+         'restore': gate_restore, 'teaching': gate_teaching,
+         'delivery': gate_delivery}
 
 
 # ── 闸门参数解析 ──────────────────────────────────────────────────────────

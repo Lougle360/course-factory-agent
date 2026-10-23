@@ -3,7 +3,7 @@ name: course-factory
 description: 「从书/知识库到课程」课程工厂的 L2 编排层——把一套资料通过「结构还原 → 组件提取 → 模块编排」三步转成可交给教学流水线的课程骨架。与 chaoyun-knowledge-base-builder（L1 萃取）和 fire-course-dev（L3 教学流水线）串联使用。核心约束：受版权保护的材料，交付物只能含「概括 + 定位」，不得摘录原文。触发词：从书到课、知识库转课程、萃取课程组件、组件提取、课程编排、模块映射、书变课、知识变课程、course factory、L2 编排。
 description_zh: 从书或知识库产出课程的 L2 编排层，含结构还原、组件提取与模块映射，带版权硬约束。
 category: education
-version: 0.4.0
+version: 0.5.0
 author: 掌柜
 ---
 
@@ -241,6 +241,8 @@ python restore_structure.py <派生md> <out.json> --report      # 只体检不�
 | `scripts/check_modules.py` | Stage 3 闸门 | 编排一致性校验 + 五项双画像对照指标 |
 | `scripts/plan_to_outline.py` | **Stage 4（交 L3）** | 编排方案 → 课程大纲骨架，自带一致性校验（`gen` / `verify`）|
 | `scripts/selftest_plan_to_outline.py` | Stage 4 自检 | 八个负例证明闸门真的会拦，不是写在纸上的 |
+| `scripts/check_schedule.py` | Stage 5 闸门 | **课程计划时间自洽**：时间轴连续性 + 逐模块时长比对 + 总量 |
+| `scripts/check_copyright.py` | Stage 6 闸门 | **版权扫描制**：交付物是否混入原材料原文（连续 20 字精确命中即拦）|
 | `scripts/check_text_hygiene.py` | 全阶段 | **外来字符卫生闸门**，所有交付物出厂前必跑 |
 
 依赖 Python 3.13 + 标准库即可，**无需第三方包**。

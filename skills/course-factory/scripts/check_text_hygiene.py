@@ -41,6 +41,14 @@ TECH_WORDS = {
     "fatal", "warn", "failed", "blocked", "passed", "pending", "running",
     "top", "bug", "promote", "demote", "drop", "evidence", "negative", "type",
     "rule", "level", "report", "gap", "pair", "single", "strict", "relaxed",
+    # 五段节奏与教学术语
+    "input", "explore", "dialogue", "reflect", "commit", "day", "step", "steps",
+    "ppt", "storyboard", "exercise", "drill", "role", "play",
+    # 画像卡字段名（YAML 键在中文行文里被引用时就会出现）
+    "pains", "scenes", "acceptance", "constraints", "promote", "demote", "drop",
+    "budget", "profile", "label", "power", "effect", "risk",
+    # 脚本与闸门术语
+    "meta", "noise", "filter", "allow", "hygiene", "copyright", "fatal", "warn",
     "status", "detail", "project", "source", "profile", "current", "history",
     # taxonomy-v2 类型名（组件清单表格里必然出现）
     "case", "tool", "viewpoint", "solution", "data", "locator", "id",

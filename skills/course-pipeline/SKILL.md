@@ -3,7 +3,7 @@ name: course-pipeline
 description: 「从书/知识库到课程」课程工厂的 L0 总控层——把 chaoyun-knowledge-base-builder（L1 萃取）、course-factory（L1.5 结构还原 + L2 组件提取 + L2 模块编排）、fire-course-dev（L3 教学流水线）四层串联成一条可执行流水线。总控自己不产出任何教学内容，只负责路由、闸门与状态机：哪一阶段该跑谁、每个阶段出口过什么闸、不过往哪退、进度与产物路径持久化以便续跑。触发词：从书到课、知识库转课程、课程流水线、课程工厂、一键出课、排课流水线、流水线状态、闸门放行、pipeline course、course pipeline、L0 总控。
 description_zh: 课程工厂四层流水线的总控层，负责路由、闸门与状态机，本身不产出教学内容。
 category: education
-version: 0.2.0
+version: 0.3.0
 author: 掌柜
 ---
 
@@ -39,13 +39,13 @@ author: 掌柜
 | 3 | L2 组件提取 | `course-factory` | `组件清单.md` | `check_components.py` |
 | 4 | L2 模块编排 | `course-factory` | 编排方案 ≥2 份 | `check_modules.py`（双画像对照）|
 | 4→5 | **交接：编排方案 → 课程大纲** | `course-factory` | 《课程大纲》 | `plan_to_outline.py verify --strict` |
-| 5 | L3 教学流水线 | `fire-course-dev` | 00–05 七件套 | rule：六类教学文件齐备 **+ 大纲交接核验** |
+| 5 | L3 教学流水线 | `fire-course-dev` | 00–05 七件套 | rule：六类教学文件齐备 **+ 大纲交接核验 + 课程计划时间自洽** |
 
 > **4→5 这一棒此前是断的**：`fire-course-dev` 全文检索「组件清单 / 编排方案」命中 0 处，
 > 两边各说各话。现已双向写死——`course-factory` 出 `plan_to_outline.py`，
 > `fire-course-dev` 的 01 阶段写入「输入材料两种入口」与三条硬约束。
 > 总控在 Stage 5 会读大纲头部的「上游」登记行，找到对应编排方案后跑严格校验。
-| 6 | 出厂 | 本 skill | 全部交付物 | `check_text_hygiene.py`（含中文散文中的外来字符与英文单词抽查）|
+| 6 | 出厂 | 本 skill | 全部交付物 | `check_text_hygiene.py` + **`check_copyright.py`（版权扫描制）** |
 
 ---
 
@@ -140,7 +140,8 @@ PY="<python>"; PL="~/.workbuddy/skills/course-pipeline/scripts/pipeline.py"
 |---|---|
 | Stage 3/4/5 必须由 AI 执行 | 总控只能验闸门，不能代替语义判定 |
 | `compared_plans` 需人工指定 | 自动按文件名排序取前两份会抓错对照对象（会取到同画像不同时长的两份），**已加显式 `--plans`**，未指定时输出告警 |
-| Stage 5 只做文件存在性 + 大纲交接核验 | 不校验教学内容质量，质量由 `fire-course-dev` 自己的阶段闸门管 |
+| Stage 5 验「文件齐备 + 大纲交接 + 计划时间自洽」 | 仍不校验教学内容质量，质量由 `fire-course-dev` 自己的阶段闸门管 |
+| 版权扫描依赖原材料可读 | `init` 时须用 `--source` 指到**可提取文本的原材料**（如 derived 下的 .md）。指向 PDF 会读成乱码，闸门会明示「未执行」而非静默跳过 |
 | 大纲与方案的配对靠头部「上游」登记行 | 手写的大纲没有这行，会被判「未登记上游」；这是有意为之——交接必须可追溯 |
 | 版权检查目前是登记制 | `strict`/`relaxed` 口径会写进状态文件并在 status 显示，但**不会自动扫描违规摘录** |
 | Stage 6 扫描排除 `kb/`、`blind/` 等中间目录 | 若交付物放在这些目录名下的子目录会被漏扫 |
