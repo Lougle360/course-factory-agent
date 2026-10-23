@@ -316,6 +316,28 @@ def gate_teaching(project, st):
             notes.append('课程计划 %d 份过时间自洽校验' % done)
     elif plans_found:
         notes.append('未找到 check_schedule.py，跳过时间校验')
+
+    # 跨文件口径一致性：单靠 check_schedule 看不见口径撕裂。
+    # 实际出过的事：计划按方案 A 排到 960（2天×480），大纲与需求说明书仍写
+    # 720（2天×360），而 check_schedule 只比对「实排 vs 大纲模块合计」——
+    # 两边恰好都是 720，于是 240 分钟的口径冲突整份放行。讲师第一天会排到
+    # 17:00，而学员通知单写的是每天 360 分钟。这不是排版错误，是交付事故。
+    cons = SKILLS / 'course-factory' / 'scripts' / 'check_consistency.py'
+    if plans_found and outlines and cons.exists():
+        proc = subprocess.run(
+            [sys.executable, str(cons), '--project', str(project)],
+            capture_output=True, text=True)
+        out = (proc.stdout or '') + (proc.stderr or '')
+        if proc.returncode == 0:
+            notes.append('交付口径跨文件一致（GROSS/NET/PERDAY 收敛）')
+        elif proc.returncode == 2:
+            notes.append('交付口径无法判定（未解析到权威源），未拦截')
+        else:
+            hits = [l.strip(' ❌') for l in out.splitlines() if l.strip().startswith('❌')]
+            problems.append('交付口径不一致（退码 %d）：%s'
+                            % (proc.returncode, '；'.join(hits)[:220]))
+    elif plans_found and outlines:
+        notes.append('未找到 check_consistency.py，跳过口径一致性校验')
     return problems, notes
 
 

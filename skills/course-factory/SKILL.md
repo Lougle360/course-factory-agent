@@ -242,6 +242,8 @@ python restore_structure.py <派生md> <out.json> --report      # 只体检不�
 | `scripts/plan_to_outline.py` | **Stage 4（交 L3）** | 编排方案 → 课程大纲骨架，自带一致性校验（`gen` / `verify`）|
 | `scripts/selftest_plan_to_outline.py` | Stage 4 自检 | 八个负例证明闸门真的会拦，不是写在纸上的 |
 | `scripts/check_schedule.py` | Stage 5 闸门 | **课程计划时间自洽**：时间轴连续性 + 逐模块时长比对 + 总量 |
+| `scripts/check_consistency.py` | Stage 5 闸门 | **跨文件交付口径**：GROSS/NET/PERDAY 必须以大纲模块之和与计划实排为唯一权威源 |
+| `scripts/selftest_check_consistency.py` | Stage 5 自检 | 九个负例，含「引号内引用不得稀释真值」这一条 |
 | `scripts/check_copyright.py` | Stage 6 闸门 | **版权扫描制**：交付物是否混入原材料原文（连续 20 字精确命中即拦）|
 | `scripts/check_text_hygiene.py` | 全阶段 | **外来字符卫生闸门**，所有交付物出厂前必跑 |
 
@@ -272,9 +274,44 @@ python plan_to_outline.py verify --outline <大纲.md> --plan <方案.md> \
 # Stage 4 闸门自检（改了解析或校验逻辑后必跑）
 python selftest_plan_to_outline.py --plan <方案.md> --components <清单.md> --outline <大纲.md>
 
+# Stage 5 闸门：课程计划时间自洽（分钟级排期）
+python check_schedule.py <课程计划.md> --outline <大纲.md>
+
+# Stage 5 闸门：跨文件交付口径一致性
+python check_consistency.py --project <目录>
+
+# Stage 5 闸门自检（改了解析或校验逻辑后必跑）
+python selftest_check_consistency.py
+
+# Stage 6 闸门：版权扫描
+python check_copyright.py <交付物.md> --source <原材料.md>
+
 # 文本卫生（交付前必跑，可传多个文件）
 python check_text_hygiene.py <交付物1.md> <交付物2.md> ...
 ```
+
+### 为什么 check_schedule 之外还要 check_consistency
+
+两道门查的不是一回事。实际出过的事：
+
+> 课程计划按方案 A 排到 **960 分钟**（2 天 × 480），正文里明写「需回写大纲第四节」——
+> 回写没做。于是同一门课在六份交付物里出现三种口径：需求说明书 720、大纲 720、
+> 计划 960、手册 960、PPT 页稿按 720 算页数。
+> 而 `check_schedule` 只比对「计划实排 vs 大纲模块合计」——**两者恰好都是 720**，
+> 240 分钟的口径撕裂被整份放行。
+> 讲师第一天会排到 17:00，而学员通知单上写的是每天 360 分钟。
+
+`check_consistency` 补足的那一段：
+
+| 量 | 唯一权威源 | 其余文件必须向它对账 |
+|---|---|---|
+| NET 教学净时长 | 大纲模块声明之和 | PPT 页稿等的 NET 声明必须相等 |
+| GROSS 总包时长 | 课程计划时间轴实排 | 需求说明书、大纲、手册的时长声明必须相等 |
+| PERDAY 每天分钟数 | 计划按天实算 | 所有「每天 N 分钟」「N 天 × M 分钟」必须相等 |
+
+⛔ **不要用「各文件投票、少数服从多数」定真值。** 第一版就是这么写的，结果课程计划
+正文里引用大纲原话的「2 天 × 360 分钟」混进票箱，把实际每天 480 的排期判成了全票通过。
+引用不是声明——凡落在 `「」""` 内的数值一律跳过求值。
 
 ---
 
